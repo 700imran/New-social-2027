@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html, body, #root {
+    height: 100%;
+  }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: #F8F9FB;
+    color: #111827;
+    overscroll-behavior-y: none;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(17, 24, 39, 0.15);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  @media (min-width: 481px) {
+    body {
+      background: #EDEFF3;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/* Component classes live in @layer components so that any Tailwind
+   utility class placed alongside them (e.g. `fixed`, `absolute`, `relative`)
+   always wins in the cascade, since the utilities layer is emitted last. */
+@layer components {
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+  .app-shell {
+    max-width: 480px;
+    margin-left: auto;
+    margin-right: auto;
+    background: #F8F9FB;
+    box-shadow: 0 0 60px rgba(8, 13, 34, 0.08);
+  }
+
+  .focus-ring:focus-visible {
+    outline: 2px solid #F97B1C;
+    outline-offset: 2px;
+  }
+}
