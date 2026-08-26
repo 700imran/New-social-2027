@@ -1,0 +1,28 @@
+name = "bharatspace-api"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# ---------------------------------------------------------------------------
+# Free-tier Cloudflare Workers. No paid features used.
+# See ../docs/Application_Level_1_Execution_Guideline.md for the design
+# rationale behind every choice below.
+# ---------------------------------------------------------------------------
+
+# R2 bucket for media (Model 3). Create with:
+#   npx wrangler r2 bucket create bharatspace-media
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "bharatspace-media"
+
+# Non-secret config. Secrets (keys, JWT secret) go in .dev.vars locally and
+# `wrangler secret put <NAME>` in production — never in this file.
+[vars]
+SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"
+R2_PUBLIC_BASE_URL = "https://media.yourdomain.com"
+R2_ACCOUNT_ID = "your-cloudflare-account-id"
+R2_BUCKET_NAME = "bharatspace-media"
+MEDIA_MAX_BYTES = "26214400" # 25 MB hard cap enforced server-side, per the guideline
+
+# Cloudflare's free-plan rate limiting rules should additionally be applied
+# to /v1/auth/* from the dashboard (Security > WAF > Rate limiting rules) —
+# that layer sits in front of the Worker and isn't configured in code.
