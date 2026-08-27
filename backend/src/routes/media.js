@@ -1,79 +1,91 @@
 import { Hono } from 'hono'
-import { AwsClient } from 'aws4fetch'
-import { userClient } from '../lib/supabase.js'
-import { requireAuth, optionalAuth } from '../lib/authMiddleware.js'
+import { createR2Client, getPresignedUploadUrl, deleteR2Object, getPublicUrl } from '../lib/r2.js'
 
 const media = new Hono()
 
-const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'video/mp4', 'video/webm'])
-
-// POST /v1/media/upload-url  { mimeType, sizeBytes }
-// -> { assetId, uploadUrl, expiresIn }
-//
-// Per the guideline: the Worker never touches file bytes (10ms CPU budget).
-// It validates the *declared* size/type server-side, writes a media_assets
-// row, and hands back a short-lived presigned PUT URL straight to R2.
-// The browser then uploads directly to that URL, bypassing this Worker.
-media.post('/media/upload-url', requireAuth, async (c) => {
-  const { mimeType, sizeBytes } = await c.req.json()
-  const maxBytes = Number(c.env.MEDIA_MAX_BYTES || 26214400)
-
-  if (!ALLOWED_MIME.has(mimeType)) {
-    return c.json({ error: `Unsupported mimeType. Allowed: ${[...ALLOWED_MIME].join(', ')}` }, 400)
+// Validate file size and type
+const validateMedia = (file, env) => {
+  const maxBytes = parseInt(env.MEDIA_MAX_BYTES || '26214400', 10) // 25MB default
+  const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm']
+  
+  if (file.size > maxBytes) {
+    throw new Error(`File size exceeds maximum of ${maxBytes / 1024 / 1024}MB`)
   }
-  if (!Number.isFinite(sizeBytes) || sizeBytes <= 0 || sizeBytes > maxBytes) {
-    return c.json({ error: `sizeBytes must be between 1 and ${maxBytes}` }, 400)
+  
+  if (!allowedMimeTypes.includes(file.type)) {
+    throw new Error(`File type ${file.type} not allowed`)
   }
+}
 
-  const userId = c.get('userId')
-  const ext = mimeType.split('/')[1]
-  const storageKey = `${userId}/${crypto.randomUUID()}.${ext}`
+// GET /v1/media/upload-url - Get presigned upload URL
+media.post('/media/upload-url', async (c) => {
+  try {
+    const { mimeType, sizeBytes, fileName } = await c.req.json()
+    
+    if (!mimeType || !sizeBytes) {
+      return c.json({ error: 'Missing mimeType or sizeBytes' }, 400)
+    }
 
-  const supabase = userClient(c.env, c.get('jwt'))
-  const { data: asset, error } = await supabase
-    .from('media_assets')
-    .insert({ owner_id: userId, storage_key: storageKey, mime_type: mimeType, size_bytes: sizeBytes })
-    .select('id')
-    .single()
-  if (error) return c.json({ error: error.message }, 400)
+    const maxBytes = parseInt(c.env.MEDIA_MAX_BYTES || '26214400', 10)
+    if (sizeBytes > maxBytes) {
+      return c.json(
+        { error: `File size exceeds maximum of ${maxBytes / 1024 / 1024}MB` },
+        413
+      )
+    }
 
-  const r2 = new AwsClient({ accessKeyId: c.env.R2_ACCESS_KEY_ID, secretAccessKey: c.env.R2_SECRET_ACCESS_KEY })
-  const endpoint = `https://${c.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${c.env.R2_BUCKET_NAME}/${storageKey}`
-  const expiresIn = 300 // 5 minutes, per the guideline: "expire in minutes, not hours"
+    const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm']
+    if (!allowedMimeTypes.includes(mimeType)) {
+      return c.json({ error: `File type ${mimeType} not allowed` }, 415)
+    }
 
-  const signed = await r2.sign(
-    new Request(endpoint, { method: 'PUT', headers: { 'Content-Type': mimeType } }),
-    { aws: { signQuery: true }, expires: expiresIn }
-  )
+    const r2Client = createR2Client(c.env)
+    const { uploadUrl, assetId, publicUrl } = await getPresignedUploadUrl(
+      r2Client,
+      c.env,
+      fileName || `media-${Date.now()}`,
+      mimeType
+    )
 
-  return c.json({ assetId: asset.id, uploadUrl: signed.url, expiresIn })
+    return c.json({ uploadUrl, assetId, publicUrl })
+  } catch (err) {
+    console.error('Upload URL error:', err)
+    return c.json({ error: err.message || 'Failed to generate upload URL' }, 500)
+  }
 })
 
-// GET /v1/media/:id -> { url, mimeType, renditionStrategy }
-//
-// This *is* MediaService.getPlaybackUrl(assetId) from the guideline: today
-// it builds a single public R2 URL from storage_key. When the full Media
-// Engine (Master Roadmap Phase 6) exists, this same function starts reading
-// the `renditions` JSONB column instead and returns an adaptive manifest —
-// callers of this endpoint never change.
-media.get('/media/:id', optionalAuth, async (c) => {
-  const supabase = userClient(c.env, c.get('jwt') || c.env.SUPABASE_ANON_KEY)
-  const { data: asset, error } = await supabase
-    .from('media_assets')
-    .select('storage_key, mime_type, rendition_strategy, renditions')
-    .eq('id', c.req.param('id'))
-    .single()
-  if (error) return c.json({ error: error.message }, 404)
+// GET /v1/media/:id - Get media public URL
+media.get('/media/:id', (c) => {
+  try {
+    const id = c.req.param('id')
+    if (!id) {
+      return c.json({ error: 'Missing media ID' }, 400)
+    }
 
-  if (asset.rendition_strategy === 'adaptive' && Object.keys(asset.renditions || {}).length) {
-    return c.json({ renditions: asset.renditions, mimeType: asset.mime_type, renditionStrategy: 'adaptive' })
+    const publicUrl = getPublicUrl(c.env, id)
+    return c.json({ url: publicUrl, assetId: id })
+  } catch (err) {
+    console.error('Get media error:', err)
+    return c.json({ error: 'Failed to retrieve media URL' }, 500)
   }
+})
 
-  return c.json({
-    url: `${c.env.R2_PUBLIC_BASE_URL}/${asset.storage_key}`,
-    mimeType: asset.mime_type,
-    renditionStrategy: asset.rendition_strategy,
-  })
+// DELETE /v1/media/:id - Delete media
+media.delete('/media/:id', async (c) => {
+  try {
+    const id = c.req.param('id')
+    if (!id) {
+      return c.json({ error: 'Missing media ID' }, 400)
+    }
+
+    const r2Client = createR2Client(c.env)
+    await deleteR2Object(r2Client, c.env, id)
+    
+    return c.json({ success: true, message: 'Media deleted' })
+  } catch (err) {
+    console.error('Delete media error:', err)
+    return c.json({ error: 'Failed to delete media' }, 500)
+  }
 })
 
 export default media

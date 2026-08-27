@@ -1,13 +1,12 @@
-# Copy this file to .dev.vars for local `wrangler dev` (gitignored).
-# In production set the same names with: npx wrangler secret put NAME
+# Supabase Configuration
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_ANON_KEY=your-anon-key
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+SUPABASE_JWT_SECRET=your-jwt-secret
 
-# Supabase project settings -> API
-SUPABASE_SERVICE_ROLE_KEY=
-SUPABASE_ANON_KEY=
-# Supabase project settings -> API -> JWT Settings -> JWT Secret
-# (legacy HS256 shared secret; used to verify the JWT on every request)
-SUPABASE_JWT_SECRET=
+# Cloudflare R2 Configuration
+R2_ACCESS_KEY_ID=your-r2-access-key
+R2_SECRET_ACCESS_KEY=your-r2-secret-key
 
-# Cloudflare dashboard -> R2 -> Manage R2 API Tokens
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
+# Optional: Custom domain settings
+R2_ACCOUNT_ID=your-account-id

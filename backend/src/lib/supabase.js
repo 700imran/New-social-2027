@@ -1,29 +1,29 @@
 import { createClient } from '@supabase/supabase-js'
 
-/**
- * Returns a Supabase client scoped to the *calling user's* JWT.
- *
- * This is the whole point of the RLS design in the guideline: every query
- * this client makes runs as that user in Postgres's eyes, so `auth.uid()`
- * inside the RLS policies resolves correctly and the database — not just
- * this route's logic — is what actually blocks cross-user access.
- */
-export function userClient(env, jwt) {
-  return createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
-    global: { headers: { Authorization: `Bearer ${jwt}` } },
-    auth: { persistSession: false, autoRefreshToken: false },
+export function createSupabaseClient(env, jwt) {
+  const url = env.SUPABASE_URL
+  const anonKey = env.SUPABASE_ANON_KEY
+
+  if (!url || !anonKey) {
+    throw new Error('Missing Supabase configuration: SUPABASE_URL or SUPABASE_ANON_KEY')
+  }
+
+  return createClient(url, anonKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+    global: {
+      headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
+    },
   })
 }
 
-/**
- * Service-role client that bypasses RLS entirely. Use only for the few
- * operations that must run with elevated privilege (e.g. reading another
- * user's public profile fields the anon/user key wouldn't otherwise see,
- * or admin-curated actions like Model 2's manual creator shortlist).
- * Never expose this key to the frontend.
- */
-export function adminClient(env) {
-  return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  })
+export function getSupabaseAuth(supabase, token) {
+  if (!token) return null
+  
+  return {
+    access_token: token,
+    token_type: 'bearer',
+  }
 }
