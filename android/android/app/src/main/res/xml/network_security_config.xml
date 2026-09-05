@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- HTTPS only, everywhere, no exceptions. Capacitor's WebView is
+         already configured for this at the JS layer
+         (capacitor.config.json's androidScheme: "https",
+         allowMixedContent: false) — this is the same guarantee enforced
+         one layer down, at the OS/network stack level, so it holds even
+         if a future code change accidentally introduces an http:// URL
+         somewhere. -->
+    <base-config cleartextTrafficPermitted="false" />
+
+    <!--
+    Certificate pinning (deliberately NOT enabled by default):
+
+    The backend in ../../backend is a Cloudflare Worker — Cloudflare
+    manages and rotates the edge TLS certificate itself, on its own
+    schedule, outside this app's control. Pinning to that certificate's
+    exact public key without backup pins means the app silently stops
+    being able to reach its own backend the next time Cloudflare rotates
+    it — a self-inflicted, hard-to-diagnose outage that's arguably worse
+    than the MitM risk pinning defends against, given the connection is
+    already TLS-encrypted and this isn't a banking/payments app.
+
+    If you still want this (e.g. before shipping something handling more
+    sensitive data), pin to Cloudflare's intermediate CA rather than the
+    leaf certificate, and always include at least one backup pin:
+
+    <domain-config>
+        <domain includeSubdomains="true">new-social-2027.imrankhan210r.workers.dev</domain>
+        <pin-set expiration="2027-01-01">
+            <pin digest="SHA-256">REPLACE-WITH-REAL-PIN==</pin>
+            <pin digest="SHA-256">REPLACE-WITH-BACKUP-PIN==</pin>
+        </pin-set>
+    </domain-config>
+
+    Compute real pins with:
+    openssl s_client -connect new-social-2027.imrankhan210r.workers.dev:443 </dev/null 2>/dev/null \
+      | openssl x509 -pubkey -noout \
+      | openssl pkey -pubin -outform der \
+      | openssl dgst -sha256 -binary | base64
+    -->
+</network-security-config>

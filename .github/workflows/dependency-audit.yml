@@ -1,0 +1,71 @@
+name: Dependency Audit
+
+# Runs `npm audit` across all three Node projects daily, plus on every
+# push — catching a newly-disclosed vulnerability in a dependency doesn't
+# wait for you to next touch that project's code. A failed run here means
+# a high/critical vulnerability was found; check the job's log for which
+# package and `npm audit fix` (or a manual version bump if that would be
+# a breaking change) in the relevant folder.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC daily
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # `path` is where each project's package.json actually lives. The
+        # web app was moved out of a web/ subfolder to the repository root
+        # a while back (see build-apk.yml's comment on the same thing) —
+        # this workflow just never got updated to match, so the "web" job
+        # was doing `cd web && npm install` against a directory that
+        # doesn't exist and failing on every single push.
+        include:
+          - project: web
+            path: .
+          - project: backend
+            path: backend
+          - project: android
+            path: android
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.path }}
+        run: npm install
+
+      - name: Audit production dependencies (blocking)
+        working-directory: ${{ matrix.path }}
+        run: npm audit --omit=dev --audit-level=high
+        # This is the check that matters most: it scans exactly what
+        # ships to a user's browser or Android device. A vulnerability
+        # here is either exploitable in production or it isn't — there's
+        # no "but it's just a build tool" excuse for shipped code.
+
+      - name: Audit dev dependencies (informational)
+        working-directory: ${{ matrix.path }}
+        run: npm audit --include=dev --audit-level=high
+        continue-on-error: true
+        # Reported but doesn't fail the workflow: a vulnerability in a
+        # build-time-only tool (bundlers, CLIs, codegen) has fundamentally
+        # different exposure than one in shipped code — it only matters if
+        # the build process itself extracts/processes untrusted input,
+        # which none of these do. Known current example: @capacitor/cli
+        # (android/package.json) pins an old `tar` with several disclosed
+        # advisories, with no non-breaking fix available — see
+        # docs/SECURITY.md §11 for why this is an accepted, tracked risk
+        # rather than a forced, untested major-version Capacitor upgrade.
+        # Check this step's log occasionally rather than ignoring it
+        # forever.
