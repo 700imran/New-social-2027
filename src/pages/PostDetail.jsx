@@ -123,11 +123,16 @@ export default function PostDetail() {
       <div className="flex-1 overflow-y-auto pb-24">
         <div className="border-b border-ink-100 px-4 py-4">
           <div className="flex items-center gap-3">
-            <Avatar user={author} size="md" />
-            <div>
-              <p className="text-sm font-semibold text-ink-900">{author?.name}</p>
-              <p className="text-xs text-ink-500">{author?.handle} · {post.time}</p>
-            </div>
+            <button
+              onClick={() => author && navigate(author.id === currentUser.id ? '/profile' : `/profile/${author.id}`)}
+              className="flex items-center gap-3 text-left"
+            >
+              <Avatar user={author} size="md" />
+              <div>
+                <p className="text-sm font-semibold text-ink-900">{author?.name}</p>
+                <p className="text-xs text-ink-500">{author?.handle} · {post.time}</p>
+              </div>
+            </button>
           </div>
 
           <p className="mt-3 whitespace-pre-line text-[15px] leading-relaxed text-ink-900">{post.text}</p>
@@ -237,6 +242,7 @@ export default function PostDetail() {
 // independently without re-rendering every other comment.
 function CommentRow({ comment, postId, pinned = false, isPostAuthor, liked, onToggleLike, onDelete, onSetPinned }) {
   const { getUser, currentUser, pushToast, userSettings } = useApp()
+  const navigate = useNavigate()
   const [menuOpen, setMenuOpen] = useState(false)
   const [langPickerOpen, setLangPickerOpen] = useState(false)
   const [translating, setTranslating] = useState(false)
@@ -317,7 +323,12 @@ function CommentRow({ comment, postId, pinned = false, isPostAuthor, liked, onTo
 
   return (
     <div className="flex items-start gap-2.5">
-      <Avatar user={commenter} size="xs" />
+      <button
+        onClick={() => commenter && navigate(commenter.id === currentUser.id ? '/profile' : `/profile/${commenter.id}`)}
+        className="shrink-0"
+      >
+        <Avatar user={commenter} size="xs" />
+      </button>
       <div className="min-w-0 flex-1">
         {pinned && (
           <p className="mb-0.5 flex items-center gap-1 text-[11px] font-semibold text-ink-500">
@@ -325,7 +336,12 @@ function CommentRow({ comment, postId, pinned = false, isPostAuthor, liked, onTo
           </p>
         )}
         <p className="text-sm text-ink-900">
-          <span className="font-semibold">{commenter?.name}</span>{' '}
+          <button
+            onClick={() => commenter && navigate(commenter.id === currentUser.id ? '/profile' : `/profile/${commenter.id}`)}
+            className="font-semibold"
+          >
+            {commenter?.name}
+          </button>{' '}
           {translation && !showOriginal ? translation.text : comment.text}
         </p>
 

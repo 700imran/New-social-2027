@@ -103,7 +103,10 @@ export default function PostCard({ post, onOpen }) {
   return (
     <article className="animate-fadeUp border-b border-ink-100 bg-white px-4 py-4">
       <div className="flex items-start justify-between">
-        <button className="flex items-start gap-3 text-left focus-ring rounded-lg" onClick={openPost}>
+        <button
+          className="flex items-start gap-3 text-left focus-ring rounded-lg"
+          onClick={() => navigate(isMe ? '/profile' : `/profile/${author.id}`)}
+        >
           <Avatar user={author} size="md" />
           <div>
             <p className="flex items-center gap-1 text-sm font-semibold text-ink-900">{author.name}</p>

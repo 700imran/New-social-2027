@@ -9,6 +9,7 @@ import {
   mapApiComment,
   mapApiNotification,
   mapApiPost,
+  mapAuthorFragment,
   mapProfileToUser,
 } from '../utils/live.js'
 
@@ -16,6 +17,41 @@ const AppContext = createContext(null)
 const { isLive } = api
 
 const TOKEN_KEY = 'bs_access_token' // kept only for backward-compat cleanup on upgrade — see bootstrap effect below
+
+// A lightweight offline-continuity cache — deliberately NOT an auth
+// mechanism. It holds no token of any kind (the access token stays
+// memory-only and the refresh token stays in its httpOnly cookie, per
+// api/client.js's own comment on why) — just a mirror of what's already
+// publicly visible on screen: your own profile display fields and
+// whatever posts/notifications were last loaded. Its only job is so that
+// losing connectivity doesn't blank the app or look like a forced sign-
+// out while the real session cookie is still perfectly valid server-side.
+const OFFLINE_CACHE_KEY = 'bs_offline_cache_v1'
+
+function saveOfflineCache(data) {
+  try {
+    localStorage.setItem(OFFLINE_CACHE_KEY, JSON.stringify(data))
+  } catch {
+    // localStorage full/disabled (private browsing, etc.) — offline
+    // continuity just has nothing to restore later; not fatal to the
+    // live session happening right now.
+  }
+}
+function loadOfflineCache() {
+  try {
+    const raw = localStorage.getItem(OFFLINE_CACHE_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+function clearOfflineCache() {
+  try {
+    localStorage.removeItem(OFFLINE_CACHE_KEY)
+  } catch {
+    /* no-op */
+  }
+}
 
 let idCounter = 1000
 const nextId = (prefix) => `${prefix}-${idCounter++}`
@@ -46,6 +82,10 @@ export function AppProvider({ children }) {
   // True only while live mode is restoring a saved session on first load —
   // lets App.jsx avoid flashing the sign-in screen before redirecting home.
   const [authLoading, setAuthLoading] = useState(isLive)
+  // True when the app is showing a cached snapshot because the last
+  // session-restore attempt couldn't reach the server at all (see the
+  // bootstrap effect below) — never set just because one action failed.
+  const [isOffline, setIsOffline] = useState(false)
 
   const [currentUser, setCurrentUser] = useState(isLive ? EMPTY_USER : { ...USERS.pooja })
 
@@ -400,10 +440,35 @@ export function AppProvider({ children }) {
         const session = await api.refreshSession()
         api.setAccessToken(session.accessToken)
         if (!cancelled) await hydrateSession(session.userId)
-      } catch {
-        // No valid session cookie (never logged in, or it expired/was
-        // revoked) — this is the normal signed-out state, not an error.
-        api.setAccessToken(null)
+      } catch (err) {
+        if (err?.isNetworkError) {
+          // No connectivity at all right now — this does NOT mean signed
+          // out. The refresh-token cookie may still be perfectly valid;
+          // we simply couldn't ask the server. Fall back to whatever was
+          // cached from the last successful session instead of bouncing
+          // to the sign-in screen over a connectivity blip. If this is
+          // the very first time this device has ever been offline (no
+          // cache yet), there's honestly nothing to restore — falls
+          // through to the normal signed-out state below, same as before.
+          const cached = loadOfflineCache()
+          if (!cancelled && cached?.user?.id) {
+            setCurrentUser(cached.user)
+            cacheUsers([cached.user])
+            setIsAuthenticated(true)
+            setHasOnboarded(Boolean(cached.hasOnboarded))
+            setSelectedTopics(cached.user.topics || [])
+            setPosts(cached.posts || [])
+            setNotifications(cached.notifications || [])
+            setFollowedUserIds(new Set(cached.followedUserIds || []))
+            setIsOffline(true)
+          }
+        } else {
+          // A real response came back and said there's no valid session
+          // — genuinely signed out (never logged in, or it expired/was
+          // revoked), not an error.
+          api.setAccessToken(null)
+          clearOfflineCache()
+        }
       } finally {
         if (!cancelled) setAuthLoading(false)
       }
@@ -414,6 +479,67 @@ export function AppProvider({ children }) {
     // Runs once on mount — hydrateSession's own deps keep it fresh.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Browser-level connectivity signal, independent of the bootstrap
+  // effect above — this fires immediately (no failed request required)
+  // if the connection drops mid-session, so the offline banner in
+  // AppLayout.jsx can appear right away rather than only after the next
+  // action happens to fail.
+  useEffect(() => {
+    const goOffline = () => setIsOffline(true)
+    window.addEventListener('offline', goOffline)
+    return () => window.removeEventListener('offline', goOffline)
+  }, [])
+
+  // ...and the recovery half: once the browser reports connectivity again,
+  // quietly confirm the session is still good and drop the offline banner
+  // — but only actually sign the person out if the *server* says the
+  // session is invalid, not just because this retry also happens to fail
+  // (a "back online" event can fire a little early on a flaky reconnect).
+  useEffect(() => {
+    if (!isLive) return
+    const handleOnline = async () => {
+      if (!isOffline) return
+      try {
+        const session = await api.refreshSession()
+        api.setAccessToken(session.accessToken)
+        await hydrateSession(session.userId)
+        setIsOffline(false)
+      } catch (err) {
+        if (!err?.isNetworkError) {
+          api.setAccessToken(null)
+          setIsAuthenticated(false)
+          setHasOnboarded(false)
+          setCurrentUser(EMPTY_USER)
+          clearOfflineCache()
+          setIsOffline(false)
+        }
+        // else: still not really reachable yet — stay in the cached/
+        // offline state and let the next 'online' event try again.
+      }
+    }
+    window.addEventListener('online', handleOnline)
+    return () => window.removeEventListener('online', handleOnline)
+  }, [isOffline, hydrateSession])
+
+  // Keeps the offline cache reasonably fresh while signed in and live, so
+  // that *whenever* connectivity drops there's always something recent to
+  // fall back to — not just right after the app first loads. Debounced:
+  // posts/notifications change often (optimistic likes, new comments)
+  // and don't each need their own localStorage write.
+  useEffect(() => {
+    if (!isLive || !isAuthenticated || isOffline) return
+    const timer = setTimeout(() => {
+      saveOfflineCache({
+        user: currentUser,
+        hasOnboarded,
+        posts: posts.slice(0, 30),
+        notifications: notifications.slice(0, 30),
+        followedUserIds: Array.from(followedUserIds),
+      })
+    }, 1000)
+    return () => clearTimeout(timer)
+  }, [isLive, isAuthenticated, isOffline, currentUser, hasOnboarded, posts, notifications, followedUserIds])
 
   // ---------------------------------------------------------------------
   // Auth actions
@@ -483,6 +609,7 @@ export function AppProvider({ children }) {
     if (isLive) {
       api.signOut().catch(() => {})
       api.setAccessToken(null)
+      clearOfflineCache()
     }
     setIsAuthenticated(false)
     setHasOnboarded(false)
@@ -502,6 +629,7 @@ export function AppProvider({ children }) {
     try {
       await api.deleteAccount()
       api.setAccessToken(null)
+      clearOfflineCache()
       setIsAuthenticated(false)
       setHasOnboarded(false)
       return { ok: true }
@@ -1063,6 +1191,60 @@ export function AppProvider({ children }) {
     [currentUser.id, posts, cacheUsers, pushToast]
   )
 
+  // Powers Profile.jsx's "view someone else's profile" mode. Returns the
+  // same shape currentUser has (mapProfileToUser already produces that),
+  // so the same JSX that renders your own profile can render anyone's.
+  const loadUserProfile = useCallback(
+    async (userId) => {
+      if (userId === currentUser.id) return currentUser
+      if (!isLive) return USERS[userId] || null
+      try {
+        const profile = await api.getProfile(userId)
+        const user = mapProfileToUser(userId, profile)
+        cacheUsers([user])
+        return user
+      } catch {
+        return null
+      }
+    },
+    [currentUser, cacheUsers]
+  )
+
+  // Fetches one user's own posts specifically — separate from the
+  // globally-paginated `posts` feed (which only reliably holds recent
+  // posts across everyone, not necessarily everything a given profile
+  // has ever posted).
+  const loadUserPosts = useCallback(
+    async (userId) => {
+      if (!isLive) return posts.filter((p) => p.authorId === userId)
+      try {
+        const rows = await api.getPosts(undefined, undefined, undefined, userId)
+        const mapped = rows.map(mapApiPost)
+        cacheUsers(mapped.map((p) => p._author))
+        return mapped
+      } catch {
+        pushToast('Could not load their posts')
+        return []
+      }
+    },
+    [posts, cacheUsers, pushToast]
+  )
+
+  // Real backend full-text-ish search (ilike on display_name) — mock mode
+  // has no server to call, so SearchOverlay's own client-side filter over
+  // `directory` already covers it there.
+  const searchUsers = useCallback(async (q) => {
+    if (!isLive || !q) return []
+    try {
+      const rows = await api.searchUsers(q)
+      const mapped = rows.map((r) => mapAuthorFragment({ id: r.id, displayName: r.display_name, avatarUrl: r.avatarUrl }))
+      cacheUsers(mapped)
+      return mapped
+    } catch {
+      return []
+    }
+  }, [cacheUsers])
+
   // Powers the new Followers/Following list pages (Profile.jsx's Followers/
   // Following counts navigate there). `kind` is 'followers' | 'following'.
   //
@@ -1240,6 +1422,7 @@ export function AppProvider({ children }) {
     isAuthenticated,
     hasOnboarded,
     authLoading,
+    isOffline,
     currentUser,
     posts: visiblePosts,
     notifications,
@@ -1280,6 +1463,9 @@ export function AppProvider({ children }) {
     createPost,
     getTaggedPosts,
     getFollowList,
+    loadUserProfile,
+    loadUserPosts,
+    searchUsers,
     userSettings,
     updateUserSettings,
     markNotificationsRead,

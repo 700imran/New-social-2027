@@ -16,6 +16,7 @@ import EditProfile from './pages/EditProfile.jsx'
 import FollowList from './pages/FollowList.jsx'
 import Settings from './pages/Settings.jsx'
 import ChangePassword from './pages/ChangePassword.jsx'
+import AccountType from './pages/AccountType.jsx'
 import ManagedAccounts from './pages/ManagedAccounts.jsx'
 import AboutApp from './pages/AboutApp.jsx'
 import NotificationSettings from './pages/NotificationSettings.jsx'
@@ -97,8 +98,12 @@ export default function App() {
         <Route path="/profile/edit" element={<EditProfile />} />
         <Route path="/profile/followers" element={<FollowList type="followers" />} />
         <Route path="/profile/following" element={<FollowList type="following" />} />
+        <Route path="/profile/:userId" element={<Profile />} />
+        <Route path="/profile/:userId/followers" element={<FollowList type="followers" />} />
+        <Route path="/profile/:userId/following" element={<FollowList type="following" />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/settings/password" element={<ChangePassword />} />
+        <Route path="/settings/account-type" element={<AccountType />} />
         <Route path="/settings/blocked" element={<ManagedAccounts type="blocked" />} />
         <Route path="/settings/muted" element={<ManagedAccounts type="muted" />} />
         <Route path="/settings/about" element={<AboutApp />} />

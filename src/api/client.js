@@ -27,6 +27,22 @@ export function setAccessToken(token) {
   accessToken = token
 }
 
+// Thrown only when fetch() itself fails to reach the server at all (no
+// connectivity, DNS failure, CORS block) — never for a real HTTP response,
+// even an error one. Callers use this to tell "we're offline" apart from
+// "the server said no", which need very different handling: a real 401
+// means genuinely signed out, but a network failure at the exact moment
+// the access token needed its once-per-load refresh must NOT be treated
+// as a sign-out — see AppContext.jsx's bootstrap effect and the
+// docs/GO_LIVE_CHECKLIST.md note this class exists to satisfy.
+export class NetworkError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'NetworkError'
+    this.isNetworkError = true
+  }
+}
+
 async function doFetch(path, { method, body, auth }) {
   const headers = { 'Content-Type': 'application/json' }
   if (auth && accessToken) headers.Authorization = `Bearer ${accessToken}`
@@ -64,7 +80,7 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
     // below, since they need different fixes and look identical to a user
     // as "nothing happened" otherwise.
     console.error(`[api] Network/CORS failure calling ${method} ${BASE_URL}${path}`, networkErr)
-    throw new Error(`Could not reach the server. If this persists, the backend's ALLOWED_ORIGINS may not include this app's origin.`)
+    throw new NetworkError(`Could not reach the server. If this persists, the backend's ALLOWED_ORIGINS may not include this app's origin.`)
   }
 
   // The access token is only ever refreshed once, on page load (see
@@ -82,7 +98,15 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
           return session
         })
       await refreshInFlight
-    } catch {
+    } catch (err) {
+      if (err?.isNetworkError) {
+        // Couldn't even reach the server to attempt the refresh — this is
+        // "we're offline right now", not "your session is invalid". Leave
+        // the (already-useless-until-reconnected) access token alone and
+        // let the caller decide how to handle being offline, instead of
+        // forcing a sign-out over a connectivity blip.
+        throw err
+      }
       setAccessToken(null)
       throw new Error('Your session has expired — please sign in again.')
     } finally {
@@ -93,7 +117,7 @@ async function request(path, { method = 'GET', body, auth = true } = {}) {
       res = await doFetch(path, { method, body, auth })
     } catch (networkErr) {
       console.error(`[api] Network/CORS failure calling ${method} ${BASE_URL}${path}`, networkErr)
-      throw new Error(`Could not reach the server. If this persists, the backend's ALLOWED_ORIGINS may not include this app's origin.`)
+      throw new NetworkError(`Could not reach the server. If this persists, the backend's ALLOWED_ORIGINS may not include this app's origin.`)
     }
   }
 
@@ -162,14 +186,16 @@ export const updateConsent = (updates) => request('/consent', { method: 'PATCH',
 // was written correctly. Leaving `auth` at its default (true) sends the
 // token when one exists and sends nothing when it doesn't — correct for
 // both cases.
-export const getPosts = (topic, kind, before) => {
+export const getPosts = (topic, kind, before, author) => {
   const params = new URLSearchParams()
   if (topic) params.set('topic', topic)
   if (kind) params.set('kind', kind)
   if (before) params.set('before', before)
+  if (author) params.set('author', author)
   const qs = params.toString()
   return request(`/posts${qs ? `?${qs}` : ''}`)
 }
+export const searchUsers = (q) => request(`/users/search?q=${encodeURIComponent(q)}`, { auth: false })
 // payload: { body, mediaAssetId?, topic?, kind?, taggedUserIds? } — kind
 // is 'post' (default) or 'reel'; taggedUserIds is an array of user ids.
 export const createPost = (payload) => request('/posts', { method: 'POST', body: payload })

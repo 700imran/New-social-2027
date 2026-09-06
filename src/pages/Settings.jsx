@@ -300,7 +300,7 @@ export default function Settings() {
           <Row
             icon={Briefcase}
             label="Account type & tools"
-            onClick={() => comingSoon('Account type & tools', 'Switch between a personal, creator or business account.', [])}
+            onClick={() => navigate('/settings/account-type')}
           />
         </Group>
 

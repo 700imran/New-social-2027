@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { ArrowLeft, Search as SearchIcon, TrendingUp, Clock, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useApp } from '../context/AppContext.jsx'
@@ -31,7 +31,7 @@ function saveRecentSearches(list) {
 export default function SearchOverlay({ onClose, initialQuery = '' }) {
   const [query, setQuery] = useState(initialQuery)
   const [recent, setRecent] = useState(loadRecentSearches)
-  const { posts, toggleFollow, followedUserIds, directory } = useApp()
+  const { posts, toggleFollow, followedUserIds, directory, searchUsers } = useApp()
   const navigate = useNavigate()
 
   const q = query.trim().toLowerCase()
@@ -53,16 +53,41 @@ export default function SearchOverlay({ onClose, initialQuery = '' }) {
     })
   }
 
-  // `directory` is the static mock roster in mock mode, or everyone
-  // encountered in the feed/comments/notifications/follows so far in live
-  // mode (see AppContext.jsx) — there's no full-text user search endpoint
-  // in the Level 1 API.
+  // `directory` (whoever's already been encountered in the feed/comments/
+  // notifications/follows so far) is instant and covers most day-to-day
+  // searches, so results render from it immediately. `remoteUsers` fills
+  // in people search hasn't crossed paths with yet, from the real
+  // GET /users/search endpoint — debounced, and only in live mode
+  // (searchUsers no-ops to [] in mock mode, see AppContext.jsx).
+  const [remoteUsers, setRemoteUsers] = useState([])
+  useEffect(() => {
+    if (!q) {
+      setRemoteUsers([])
+      return
+    }
+    let cancelled = false
+    const timer = setTimeout(() => {
+      searchUsers(q).then((rows) => {
+        if (!cancelled) setRemoteUsers(rows)
+      })
+    }, 300)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [q, searchUsers])
+
   const matchedUsers = useMemo(() => {
     if (!q) return []
-    return directory.filter(
+    const local = directory.filter(
       (u) => u.name?.toLowerCase().includes(q) || u.handle?.toLowerCase().includes(q)
     )
-  }, [q, directory])
+    const merged = [...local]
+    for (const u of remoteUsers) {
+      if (!merged.some((m) => m.id === u.id)) merged.push(u)
+    }
+    return merged
+  }, [q, directory, remoteUsers])
 
   const matchedPosts = useMemo(() => {
     if (!q) return []
@@ -170,16 +195,23 @@ export default function SearchOverlay({ onClose, initialQuery = '' }) {
             <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-500">People</p>
             {matchedUsers.map((u) => (
               <div key={u.id} className="flex items-center justify-between py-2">
-                <div className="flex items-center gap-3">
+                <button
+                  onClick={() => {
+                    commitRecent(query)
+                    onClose()
+                    navigate(`/profile/${u.id}`)
+                  }}
+                  className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                >
                   <Avatar user={u} size="sm" />
-                  <div>
-                    <p className="text-sm font-semibold text-ink-900">{u.name}</p>
-                    <p className="text-xs text-ink-500">{u.handle}</p>
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-ink-900">{u.name}</p>
+                    <p className="truncate text-xs text-ink-500">{u.handle}</p>
                   </div>
-                </div>
+                </button>
                 <button
                   onClick={() => toggleFollow(u.id)}
-                  className={`rounded-full border px-3 py-1 text-xs font-semibold transition-colors ${
+                  className={`shrink-0 rounded-full border px-3 py-1 text-xs font-semibold transition-colors ${
                     followedUserIds.has(u.id)
                       ? 'border-ink-300 text-ink-700'
                       : 'border-saffron-500 bg-saffron-500 text-white'

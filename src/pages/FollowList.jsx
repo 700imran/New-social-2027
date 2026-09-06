@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import PageHeader from '../components/PageHeader.jsx'
 import Avatar from '../components/Avatar.jsx'
 import { useApp } from '../context/AppContext.jsx'
@@ -9,8 +10,15 @@ import { useApp } from '../context/AppContext.jsx'
 // for Blocked/Muted. Reached from Profile.jsx's Followers/Following
 // counts, which is the "required behavior" this page exists to satisfy:
 // those counts must open the full list, not just sit there as text.
+//
+// Also reachable for someone *else's* profile (routed as
+// /profile/:userId/followers|following) — :userId in the URL is who the
+// list belongs to; falls back to your own id on the no-param routes.
 export default function FollowList({ type }) {
   const { currentUser, followedUserIds, toggleFollow, getFollowList } = useApp()
+  const navigate = useNavigate()
+  const { userId } = useParams()
+  const targetId = userId || currentUser.id
   const [people, setPeople] = useState([])
   const [loading, setLoading] = useState(true)
   const isFollowers = type === 'followers'
@@ -18,7 +26,7 @@ export default function FollowList({ type }) {
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    getFollowList(currentUser.id, type).then((rows) => {
+    getFollowList(targetId, type).then((rows) => {
       if (!cancelled) {
         setPeople(rows)
         setLoading(false)
@@ -27,7 +35,7 @@ export default function FollowList({ type }) {
     return () => {
       cancelled = true
     }
-  }, [type, currentUser.id, getFollowList])
+  }, [type, targetId, getFollowList])
 
   return (
     <div>
@@ -54,11 +62,16 @@ export default function FollowList({ type }) {
             const isFollowing = followedUserIds.has(person.id)
             return (
               <div key={person.id} className="flex items-center gap-3 py-3.5">
-                <Avatar user={person} size="md" showVerified={false} />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold text-ink-900">{person.name}</p>
-                  {person.handle && <p className="truncate text-xs text-ink-500">{person.handle}</p>}
-                </div>
+                <button
+                  onClick={() => navigate(person.id === currentUser.id ? '/profile' : `/profile/${person.id}`)}
+                  className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                >
+                  <Avatar user={person} size="md" showVerified={false} />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-semibold text-ink-900">{person.name}</p>
+                    {person.handle && <p className="truncate text-xs text-ink-500">{person.handle}</p>}
+                  </div>
+                </button>
                 <button
                   onClick={() => toggleFollow(person.id)}
                   className={`shrink-0 rounded-full px-3.5 py-1.5 text-xs font-semibold transition-colors ${

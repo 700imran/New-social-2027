@@ -91,10 +91,13 @@ async function enrichPosts(supabase, env, rows, myId) {
   })
 }
 
-// GET /v1/posts?topic=Tech&kind=reel&limit=20&before=2026-09-01T00:00:00Z
+// GET /v1/posts?topic=Tech&kind=reel&author=<userId>&limit=20&before=2026-09-01T00:00:00Z
 // — public feed read (RLS: publicly readable).
 // `kind` defaults to no filter (returns posts and reels together) so the
 // main Home feed doesn't need to change; Reels.jsx passes kind=reel.
+// `author` scopes to one user's own posts — used by Profile.jsx when
+// viewing someone else's profile, where the globally-paginated home feed
+// cache can't be relied on to already contain everything they've posted.
 // `before` is a cursor, not an offset: pass the `created_at` of the last
 // post you already have to get the next page strictly older than it.
 // Cursor-based rather than offset-based so a new post landing between two
@@ -103,12 +106,14 @@ async function enrichPosts(supabase, env, rows, myId) {
 posts.get('/posts', optionalAuth, async (c) => {
   const topic = c.req.query('topic')
   const kind = c.req.query('kind')
+  const author = c.req.query('author')
   const before = c.req.query('before')
   const limit = Number(c.req.query('limit') || 30)
   const supabase = userClient(c.env, c.get('jwt') || c.env.SUPABASE_ANON_KEY)
   let query = supabase.from('posts').select('*').order('created_at', { ascending: false }).limit(limit)
   if (topic) query = query.eq('topic', topic)
   if (kind) query = query.eq('kind', kind)
+  if (author) query = query.eq('author_id', author)
   if (before) query = query.lt('created_at', before)
   const { data, error } = await query
   if (error) return dbError(c, error)

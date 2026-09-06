@@ -1,34 +1,22 @@
 import React, { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { LogOut, TriangleAlert, Camera } from 'lucide-react'
+import { Camera, TriangleAlert } from 'lucide-react'
 import PageHeader from '../components/PageHeader.jsx'
 import Avatar from '../components/Avatar.jsx'
 import { useApp } from '../context/AppContext.jsx'
 
-const ACCOUNT_TYPES = [
-  { id: 'personal', label: 'Personal' },
-  {
-    id: 'creator',
-    label: 'Creator',
-    comingSoon: {
-      title: 'Creator Studio',
-      description: 'A dashboard for your content, audience insights and brand collaborations.',
-      bullets: ['Portfolio and media kit', 'Audience and growth insights', 'Brand collaboration requests', 'Rate card and availability'],
-    },
-  },
-  {
-    id: 'brand',
-    label: 'Brand',
-    comingSoon: {
-      title: 'Brand Studio',
-      description: 'Run campaigns and find creators to partner with, right from your account.',
-      bullets: ['Company profile and products', 'Create and manage campaigns', 'Find and filter creators', 'Track collaborations'],
-    },
-  },
-]
-
+// Account type (Personal/Creator/Brand) and the duplicate Sign out button
+// used to live on this screen too — both moved to Profile's ••• menu,
+// which already has Settings and Sign out, so this form is just the
+// fields that actually edit your profile.
+//
+// The Danger Zone below stays: DeleteAccountRequest.jsx (the public, no
+// -login page Google Play's Data Safety form requires) sends signed-in
+// visitors here for "the real delete flow" — moving it without updating
+// that redirect would silently break account deletion, so it's kept in
+// place rather than relocated.
 export default function EditProfile() {
-  const { currentUser, updateProfile, signOut, deleteAccount } = useApp()
+  const { currentUser, updateProfile, deleteAccount } = useApp()
   const navigate = useNavigate()
   const [name, setName] = useState(currentUser.name)
   const [bio, setBio] = useState(currentUser.bio ?? '')
@@ -61,11 +49,6 @@ export default function EditProfile() {
       avatarPreview: avatarPreview || undefined,
     })
     navigate('/profile')
-  }
-
-  const handleSignOut = () => {
-    signOut()
-    navigate('/')
   }
 
   const handleDeleteAccount = async () => {
@@ -148,36 +131,7 @@ export default function EditProfile() {
           />
         </label>
 
-        <div className="block">
-          <span className="mb-1.5 block text-xs font-semibold text-ink-700">Account type</span>
-          <div className="grid grid-cols-3 gap-2">
-            {ACCOUNT_TYPES.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                onClick={() => (t.id === 'personal' ? null : navigate('/coming-soon', { state: t.comingSoon }))}
-                className={`rounded-xl border px-2 py-2.5 text-center text-xs font-semibold transition-colors ${
-                  t.id === 'personal' ? 'border-saffron-500 bg-saffron-50 text-saffron-700' : 'border-ink-200 text-ink-600'
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-          <p className="mt-1.5 text-[11px] text-ink-500">
-            Creator and Brand accounts add a portfolio, insights and collaboration tools on top of your profile.
-          </p>
-        </div>
-
-        <button
-          type="button"
-          onClick={handleSignOut}
-          className="focus-ring flex items-center justify-center gap-2 rounded-xl border border-ink-200 py-3 text-sm font-semibold text-ink-700"
-        >
-          <LogOut className="h-4 w-4" /> Sign out
-        </button>
-
-        <div className="mt-4 rounded-xl border border-bharat-red/30 bg-bharat-red/5 p-4">
+        <div className="mt-2 rounded-xl border border-bharat-red/30 bg-bharat-red/5 p-4">
           <p className="flex items-center gap-1.5 text-sm font-bold text-bharat-red">
             <TriangleAlert className="h-4 w-4" /> Danger zone
           </p>

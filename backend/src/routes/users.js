@@ -6,6 +6,50 @@ import { requireText, LIMITS } from '../lib/security.js'
 
 const users = new Hono()
 
+// GET /v1/users/search?q=ravi&limit=20 — the "search people" half of
+// SearchOverlay.jsx, which previously only searched the client's local
+// `directory` (whoever had already been encountered in the feed/comments/
+// notifications so far) since no such endpoint existed. ilike over
+// `display_name` is the whole search — no username/handle column exists
+// in the schema to also match against (handles are computed client-side,
+// see utils/live.js's handleFor).
+//
+// Registered before /users/:id (below) so a literal "search" can never
+// be swallowed as someone's :id — static routes must win over param
+// routes here regardless of how the underlying router prioritizes them.
+users.get('/users/search', optionalAuth, async (c) => {
+  const raw = (c.req.query('q') || '').trim().slice(0, 60)
+  if (!raw) return c.json([])
+  const limit = Math.min(Number(c.req.query('limit')) || 20, 30)
+  // Escape ILIKE's own wildcard characters so a search for "50% off" or
+  // "under_score" matches literally instead of acting as a wildcard.
+  const escaped = raw.replace(/[%_]/g, (m) => `\\${m}`)
+
+  const supabase = userClient(c.env, c.get('jwt') || c.env.SUPABASE_ANON_KEY)
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('user_id, display_name, avatar_asset_id')
+    .ilike('display_name', `%${escaped}%`)
+    .limit(limit)
+  if (error) return dbError(c, error)
+
+  const avatarAssetIds = data.filter((p) => p.avatar_asset_id).map((p) => p.avatar_asset_id)
+  const avatarRes = avatarAssetIds.length
+    ? await supabase.from('media_assets').select('id, storage_key').in('id', avatarAssetIds)
+    : { data: [] }
+  const mediaById = Object.fromEntries((avatarRes.data || []).map((m) => [m.id, m]))
+
+  return c.json(
+    data.map((p) => ({
+      id: p.user_id,
+      display_name: p.display_name,
+      avatarUrl: p.avatar_asset_id && mediaById[p.avatar_asset_id]
+        ? `${c.env.R2_PUBLIC_BASE_URL}/${mediaById[p.avatar_asset_id].storage_key}`
+        : null,
+    }))
+  )
+})
+
 // GET /v1/users/:id
 users.get('/users/:id', optionalAuth, async (c) => {
   const supabase = userClient(c.env, c.get('jwt') || c.env.SUPABASE_ANON_KEY)
