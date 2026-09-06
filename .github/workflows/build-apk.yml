@@ -1,0 +1,124 @@
+name: Build Android APK
+
+# Builds a real, installable debug APK on GitHub's own runners — which,
+# unlike the sandboxed environment this project was originally assembled
+# in, have full internet access to Google's Maven repo and Gradle's
+# distribution servers.
+#
+# This is the fix for a "cordova.variables.gradle not found" / "Could not
+# find ../capacitor-cordova-android-plugins/cordova.variables.gradle"
+# Gradle failure: that file, and the whole
+# android/capacitor-cordova-android-plugins/ folder, is *generated* by
+# `npx cap sync android`, not something to commit to git (see
+# android/.gitignore). A workflow that jumps straight to `./gradlew
+# assembleDebug` without running `npm install` + `cap sync` first will
+# fail exactly this way, every time, regardless of what happens to be
+# committed — the earlier version of this workflow did exactly that.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  build-debug-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install web app dependencies
+        run: npm install
+        # Repo root — the web app was moved out of a web/ subfolder to
+        # the repository root (see git history). No working-directory
+        # needed; this runs in $GITHUB_WORKSPACE by default.
+
+      - name: Build web app
+        run: npm run build
+        # Uses .env.production, already committed with the real backend
+        # URL baked in — see .env.production and
+        # docs/GO_LIVE_CHECKLIST.md. To point a build at a different
+        # backend without editing that file, override it here instead:
+        #   env:
+        #     VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+
+      - name: Install Android wrapper dependencies
+        working-directory: android
+        run: npm install
+
+      - name: Sync web build into the native Android project
+        working-directory: android
+        run: npm run sync
+        # This is the step a bare `./gradlew assembleDebug` skips. It's
+        # what (re)generates android/capacitor-cordova-android-plugins/
+        # from the @capacitor/android package and copies the just-built
+        # web assets into android/app/src/main/assets/public. Skipping it
+        # is exactly what produces the Gradle failure this workflow exists
+        # to fix.
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x android/android/gradlew
+
+      # Writes the SAME android/keystore.properties (+ the keystore file
+      # it points to) that a local release build reads — see the comment
+      # at the top of android/android/app/build.gradle. This is what
+      # makes every APK this workflow produces installable over the
+      # previous one instead of forcing beta users to uninstall/reinstall.
+      #
+      # Required repo secrets (Settings → Secrets and variables → Actions):
+      #   RELEASE_KEYSTORE_BASE64   — `base64 -w0 your.keystore`
+      #   RELEASE_KEYSTORE_PASSWORD
+      #   RELEASE_KEY_ALIAS
+      #   RELEASE_KEY_PASSWORD
+      # Generate these once and never regenerate them for this app — see
+      # android/README.md.
+      - name: Configure release signing
+        working-directory: android/android
+        run: |
+          set -e
+          if [ -n "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > app/release.keystore
+            {
+              echo "storeFile=release.keystore"
+              echo "storePassword=${{ secrets.RELEASE_KEYSTORE_PASSWORD }}"
+              echo "keyAlias=${{ secrets.RELEASE_KEY_ALIAS }}"
+              echo "keyPassword=${{ secrets.RELEASE_KEY_PASSWORD }}"
+            } > keystore.properties
+            echo "Release signing configured from repo secrets."
+          else
+            echo "::warning::RELEASE_KEYSTORE_BASE64 is not set — this build will be an UNSIGNED release apk that cannot be installed as-is and will NOT match any previously-installed signed build. Add the four RELEASE_* secrets (see android/README.md) before distributing to beta users."
+          fi
+
+      - name: Build release APK
+        working-directory: android/android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Read version name for the artifact name
+        id: ver
+        working-directory: android/android
+        run: |
+          VERSION=$(grep VERSION_NAME version.properties | cut -d= -f2 | tr -d '[:space:]')
+          # Remove invalid characters for artifact names
+          CLEAN_VERSION=$(echo "$VERSION" | tr -d '#' | sed 's/[<>:|?*]//g' | sed 's/[()]//g')
+          echo "name=${CLEAN_VERSION}" >> "$GITHUB_OUTPUT"
+          
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bharatspace-beta-${{ steps.ver.outputs.name }}
+          path: android/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error

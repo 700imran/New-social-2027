@@ -1,0 +1,54 @@
+name = "new-social-2027"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# ---------------------------------------------------------------------------
+# Plain text variables — deployed with the code so they never get lost.
+# Sensitive values (keys, secrets) stay as dashboard Secrets only.
+# ---------------------------------------------------------------------------
+[vars]
+SUPABASE_URL = "https://evthqzpgsjjbkgpvaact.supabase.co"
+R2_PUBLIC_BASE_URL = "https://pub-e1dab80495774ca4ae592cf5bf2d7bb7.r2.dev"
+R2_ACCOUNT_ID = "9a92c50b5b02146e2d54319f094a7fda"
+R2_BUCKET_NAME = "bharatspace-media"
+MEDIA_MAX_BYTES = "104857600"
+ALLOWED_ORIGINS = "https://new-social-2027.vercel.app,https://localhost"
+FRONTEND_URL = "https://new-social-2027.vercel.app"
+
+# ---------------------------------------------------------------------------
+# R2 bucket for media (Model 3).
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "bharatspace-media"
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+[[ratelimits]]
+name = "AUTH_RATE_LIMITER"
+namespace_id = "1001"
+[ratelimits.simple]
+limit = 10
+period = 60
+
+[[ratelimits]]
+name = "REFRESH_RATE_LIMITER"
+namespace_id = "1002"
+[ratelimits.simple]
+limit = 30
+period = 60
+
+[[ratelimits]]
+name = "WRITE_RATE_LIMITER"
+namespace_id = "1003"
+[ratelimits.simple]
+limit = 20
+period = 60
+
+[[ratelimits]]
+name = "MEDIA_RATE_LIMITER"
+namespace_id = "1004"
+[ratelimits.simple]
+limit = 10
+period = 60

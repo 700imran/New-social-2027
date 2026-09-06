@@ -1,0 +1,53 @@
+# Copy this file to .dev.vars for local `wrangler dev` (gitignored).
+# In production set EVERY one of these — not just the secrets below — as
+# a Cloudflare Worker Variable/Secret in the dashboard: Workers & Pages ->
+# bharatspace-api -> Settings -> Variables and Secrets. Nothing here is
+# read from wrangler.toml anymore; see the comment block at the top of
+# that file for why.
+
+# Supabase project settings -> API -> Project URL
+SUPABASE_URL=
+# Supabase project settings -> API
+SUPABASE_SERVICE_ROLE_KEY=
+SUPABASE_ANON_KEY=
+# Supabase project settings -> API -> JWT Settings -> JWT Secret
+# (legacy HS256 shared secret; used to verify the JWT on every request)
+SUPABASE_JWT_SECRET=
+
+# Cloudflare dashboard -> R2 -> your bucket -> Settings -> Public access
+R2_PUBLIC_BASE_URL=
+# Cloudflare dashboard -> Overview -> Account ID
+R2_ACCOUNT_ID=
+R2_BUCKET_NAME=bharatspace-media
+# Optional — 25 MB if unset
+MEDIA_MAX_BYTES=26214400
+
+# Comma-separated, no spaces needed (trimmed) — frontend origin(s) allowed
+# to call this API. Include your Vercel URL, any custom domain, and
+# https://localhost for the Android wrapper (Capacitor's WebView origin).
+ALLOWED_ORIGINS=https://new-social-2027.vercel.app,https://localhost
+# Used to build the password-reset email's redirect link — deployed
+# frontend's origin, no trailing slash.
+FRONTEND_URL=https://new-social-2027.vercel.app
+
+# Cloudflare dashboard -> R2 -> Manage R2 API Tokens
+R2_ACCESS_KEY_ID=
+R2_SECRET_ACCESS_KEY=
+
+# Optional. Cloudflare dashboard -> Turnstile -> your widget -> Secret Key.
+# Leave unset and Turnstile verification is skipped entirely (see
+# lib/security.js's verifyTurnstile) — signup/login still work, just
+# without bot mitigation. Free and unlimited; see ../docs/SECURITY.md.
+TURNSTILE_SECRET_KEY=
+
+# Optional. resend.com -> API Keys. Powers the welcome email (auto-sent
+# from /auth/signup) and the admin-only promotional broadcast
+# (/admin/broadcast) — see lib/email.js. Leave both unset and both no-op
+# safely (a warning is logged, nothing else breaks). This does NOT affect
+# Supabase's own confirmation/OTP/password-reset emails, which are
+# separately configured in the Supabase dashboard — see
+# ../docs/EMAIL_SETUP.md for both.
+RESEND_API_KEY=
+# Must be an address on a domain you've verified in Resend, e.g.
+# "BharatSpace <hello@yourdomain.com>".
+EMAIL_FROM_ADDRESS=

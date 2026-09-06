@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html, body, #root {
+    height: 100%;
+  }
+
+  body {
+    font-family: 'Inter', sans-serif;
+    background: #F8F9FB;
+    color: #111827;
+    overscroll-behavior-y: none;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(17, 24, 39, 0.15);
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  @media (min-width: 481px) {
+    body {
+      background: #EDEFF3;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  /* iOS Safari zooms the page in on tap if a text input's font is under
+     16px — this keeps every input/textarea/select at 16px on small
+     screens so focusing a field never triggers that zoom. */
+  @media (max-width: 768px) {
+    input, textarea, select {
+      font-size: 16px;
+    }
+  }
+
+  img {
+    -webkit-user-drag: none;
+    user-drag: none;
+  }
+}
+
+/* Component classes live in @layer components so that any Tailwind
+   utility class placed alongside them (e.g. `fixed`, `absolute`, `relative`)
+   always wins in the cascade, since the utilities layer is emitted last. */
+@layer components {
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+  .app-shell {
+    max-width: 480px;
+    margin-left: auto;
+    margin-right: auto;
+    background: #F8F9FB;
+    box-shadow: 0 0 60px rgba(8, 13, 34, 0.08);
+  }
+
+  .focus-ring:focus-visible {
+    outline: 2px solid #F97B1C;
+    outline-offset: 2px;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, #EDEFF3 25%, #E3E6EC 50%, #EDEFF3 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .fade-in-up {
+    animation: fadeInUp 0.3s ease-out;
+  }
+}

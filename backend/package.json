@@ -1,0 +1,20 @@
+{
+  "name": "bharatspace-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "aws4fetch": "^1.0.20",
+    "hono": "^4.6.3",
+    "jose": "^5.9.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
