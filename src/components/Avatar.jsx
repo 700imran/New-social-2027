@@ -18,6 +18,8 @@ export default function Avatar({ user, size = 'md', showVerified = true, classNa
         <img
           src={user.avatarUrl}
           alt={user.name || 'Avatar'}
+          loading="lazy"
+          decoding="async"
           className={`${sizeClass} rounded-full object-cover ring-2 ring-white shadow-sm select-none`}
         />
       ) : (

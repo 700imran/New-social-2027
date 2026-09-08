@@ -12,10 +12,13 @@
       rel="stylesheet"
     />
     <link rel="icon" href="data:,">
-    <!-- Cloudflare Turnstile — free, unlimited (see docs/SECURITY.md). Always
-         loaded; components/TurnstileWidget.jsx only renders a challenge when
-         VITE_TURNSTILE_SITE_KEY is configured, so this is a no-op otherwise. -->
-    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <!-- Cloudflare Turnstile (see docs/SECURITY.md) is intentionally NOT
+         loaded here. It used to be unconditional on every single page
+         load — home feed, reels, settings, all of it — for a challenge
+         that only ever renders on SignUp/SignIn. TurnstileWidget.jsx now
+         injects the script itself, only when VITE_TURNSTILE_SITE_KEY is
+         configured and that component actually mounts, so a signed-in
+         user's everyday app opens no longer pay for it at all. -->
   </head>
   <body>
     <div id="root"></div>

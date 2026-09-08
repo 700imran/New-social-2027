@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
-import { COMMUNITIES, INITIAL_NOTIFICATIONS, INITIAL_POSTS, USERS } from '../data/mockData.js'
+import { COMMUNITIES, CONVERSATIONS, INITIAL_NOTIFICATIONS, INITIAL_POSTS, MOCK_MESSAGES, USERS } from '../data/mockData.js'
 import * as api from '../api/client.js'
 import {
   avatarToneFor,
@@ -7,6 +7,8 @@ import {
   initialsFor,
   isEmail,
   mapApiComment,
+  mapApiConversation,
+  mapApiMessage,
   mapApiNotification,
   mapApiPost,
   mapAuthorFragment,
@@ -110,6 +112,15 @@ export function AppProvider({ children }) {
   // did, and nothing changes on their end.
   const [mutedUserIds, setMutedUserIds] = useState(new Set())
   const [hiddenPostIds, setHiddenPostIds] = useState(new Set())
+  // Direct messages. Deliberately NOT fetched from the auth bootstrap
+  // effect below (unlike posts/notifications/saved/etc.) — Home.jsx's own
+  // mount effect calls fetchConversationsLive instead, so a feature most
+  // visits never open never adds a request to the critical first-load
+  // path. messagesByConversation fills in per-thread as ChatThread.jsx
+  // opens each one (see loadMessages).
+  const [conversations, setConversations] = useState(isLive ? [] : CONVERSATIONS)
+  const [messagesByConversation, setMessagesByConversation] = useState(isLive ? {} : MOCK_MESSAGES)
+  const [conversationsLoaded, setConversationsLoaded] = useState(!isLive)
   // Live-backed by user_settings (docs/migrations/011_user_settings.sql) —
   // this default mirrors backend/src/routes/settings.js's DEFAULTS
   // exactly, so mock mode (and the gap before fetchSettingsLive resolves
@@ -261,6 +272,33 @@ export function AppProvider({ children }) {
     }
   }, [posts, hasMorePosts, loadingMorePosts, cacheUsers])
 
+  // A post referenced by id that ISN'T already in `posts` — a real deep
+  // link (PostDetail.jsx), or a shared-post message in a chat thread
+  // (ChatThread.jsx) whose post never happened to be part of this
+  // session's feed. Backend's GET /posts/:id (routes/posts.js) exists
+  // specifically for this; mock mode's `posts` is already the complete
+  // fixed list, so there's nothing further to fetch there — a miss just
+  // means the post genuinely doesn't exist.
+  const fetchPostById = useCallback(
+    async (id) => {
+      const existing = posts.find((p) => p.id === id)
+      if (existing) return existing
+      if (!isLive) return null
+      try {
+        const row = await api.getPost(id)
+        const mapped = mapApiPost(row)
+        cacheUsers([mapped._author])
+        setPosts((prev) => (prev.some((p) => p.id === mapped.id) ? prev : [...prev, mapped]))
+        if (mapped._likedByMe) setLikedPostIds((prev) => new Set(prev).add(mapped.id))
+        return mapped
+      } catch (err) {
+        console.error('[fetchPostById] failed', err)
+        return null
+      }
+    },
+    [posts, cacheUsers]
+  )
+
   const fetchNotificationsLive = useCallback(async () => {
     if (!isLive) return
     try {
@@ -304,6 +342,144 @@ export function AppProvider({ children }) {
     },
     [cacheUsers]
   )
+
+  // --- Direct messages (backend/src/routes/messages.js) -----------------
+  //
+  // Called from Home.jsx's mount effect, not the bootstrap effect below —
+  // see the `conversations` state comment above for why.
+  const fetchConversationsLive = useCallback(async () => {
+    if (!isLive) {
+      setConversationsLoaded(true)
+      return
+    }
+    try {
+      const rows = await api.getConversations()
+      const mapped = rows.map(mapApiConversation)
+      setConversations(mapped)
+      cacheUsers(mapped.map((c) => c._author))
+    } catch (err) {
+      console.error('[fetchConversationsLive] failed', err)
+    } finally {
+      setConversationsLoaded(true)
+    }
+  }, [cacheUsers])
+
+  // Get-or-create the 1:1 thread with `userId` — what Profile.jsx's
+  // Message button (navigate(`/messages/${targetId}`) — a user id, not a
+  // conversation id) and the Share sheet's recipient list both need
+  // before they have a conversation id to work with. Always round-trips
+  // in live mode rather than trusting already-loaded `conversations`
+  // state, since reaching this via a deep link (a shared profile,
+  // opening the app straight to someone's profile) can't guarantee the
+  // list was ever fetched first — the endpoint is idempotent either way.
+  const getOrCreateConversation = useCallback(
+    async (userId) => {
+      if (!isLive) {
+        const existing = conversations.find((c) => c.authorId === userId)
+        if (existing) return existing
+        const created = { id: nextId('conv'), authorId: userId, lastMessage: null, unreadCount: 0 }
+        setConversations((prev) => [created, ...prev])
+        setMessagesByConversation((prev) => ({ ...prev, [created.id]: prev[created.id] || [] }))
+        return created
+      }
+
+      const row = await api.startConversation(userId)
+      const mapped = mapApiConversation(row)
+      cacheUsers([mapped._author])
+      setConversations((prev) => [mapped, ...prev.filter((c) => c.id !== mapped.id)])
+      return mapped
+    },
+    [conversations, cacheUsers]
+  )
+
+  const loadMessages = useCallback(
+    async (conversationId) => {
+      if (!isLive) return // mock threads (MOCK_MESSAGES) already ship fully populated
+      try {
+        const rows = await api.getMessages(conversationId)
+        const mapped = rows.map(mapApiMessage)
+        setMessagesByConversation((prev) => ({ ...prev, [conversationId]: mapped }))
+      } catch (err) {
+        console.error('[loadMessages] failed', err)
+        pushToast('Could not load this conversation')
+      }
+    },
+    [pushToast]
+  )
+
+  // Same optimistic-with-rollback shape as addComment above. `sharedPost`
+  // is what Reels.jsx/PostCard.jsx's Share sheet passes to send a post/
+  // reel straight into a thread instead of (or alongside) text.
+  const sendMessage = useCallback(
+    (conversationId, { text, sharedPostId } = {}) => {
+      const trimmed = (text || '').trim()
+      if (!trimmed && !sharedPostId) return
+
+      const message = { id: nextId('msg'), senderId: currentUser.id, text: trimmed || null, sharedPostId: sharedPostId || null, time: 'now' }
+      setMessagesByConversation((prev) => ({ ...prev, [conversationId]: [...(prev[conversationId] || []), message] }))
+      setConversations((prev) => {
+        const next = prev.map((c) =>
+          c.id === conversationId
+            ? { ...c, lastMessage: { text: message.text, sharedPost: !!message.sharedPostId, time: 'now' }, unreadCount: 0 }
+            : c
+        )
+        // A message sent from the Share sheet to someone with no existing
+        // row in `conversations` yet (get-or-create just made one this
+        // same tick) is already present by id — nothing further to do.
+        return next
+      })
+
+      if (isLive) {
+        api
+          .sendMessage(conversationId, { body: trimmed || undefined, sharedPostId: sharedPostId || undefined })
+          .then((row) => {
+            const mapped = mapApiMessage(row)
+            setMessagesByConversation((prev) => ({
+              ...prev,
+              [conversationId]: (prev[conversationId] || []).map((m) => (m.id === message.id ? mapped : m)),
+            }))
+          })
+          .catch((err) => {
+            console.error('[sendMessage] failed, rolling back', err)
+            pushToast('Could not send your message — try again')
+            setMessagesByConversation((prev) => ({
+              ...prev,
+              [conversationId]: (prev[conversationId] || []).filter((m) => m.id !== message.id),
+            }))
+          })
+      }
+    },
+    [currentUser.id, pushToast]
+  )
+
+  // "delete after if want" — sender-only, hard delete (see
+  // migrations/012_direct_messages.sql). Snapshotting the whole thread
+  // before removing is simpler and safer to roll back than trying to
+  // reinsert one message back into the right position on failure.
+  const deleteMessage = useCallback(
+    (conversationId, messageId) => {
+      const prevList = messagesByConversation[conversationId] || []
+      setMessagesByConversation((prev) => ({ ...prev, [conversationId]: prevList.filter((m) => m.id !== messageId) }))
+
+      if (isLive) {
+        api.deleteMessage(messageId).catch((err) => {
+          console.error('[deleteMessage] failed, rolling back', err)
+          pushToast('Could not delete this message — try again')
+          setMessagesByConversation((prev) => ({ ...prev, [conversationId]: prevList }))
+        })
+      }
+    },
+    [messagesByConversation, pushToast]
+  )
+
+  const markConversationRead = useCallback((conversationId) => {
+    setConversations((prev) => prev.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c)))
+    if (isLive) {
+      api.markConversationRead(conversationId).catch((err) => console.error('[markConversationRead] failed', err))
+    }
+  }, [])
+
+  const unreadMessagesCount = useMemo(() => conversations.reduce((sum, c) => sum + (c.unreadCount || 0), 0), [conversations])
 
   // Same shape of problem as fetchSavedPostsLive above, simpler answer:
   // GET /hidden-posts only ever needs to feed the `visiblePosts` filter,
@@ -1455,7 +1631,18 @@ export function AppProvider({ children }) {
     repost,
     addComment,
     loadComments,
+    conversations,
+    conversationsLoaded,
+    messagesByConversation,
+    unreadMessagesCount,
+    fetchConversationsLive,
+    getOrCreateConversation,
+    loadMessages,
+    sendMessage,
+    deleteMessage,
+    markConversationRead,
     fetchPostsLive,
+    fetchPostById,
     fetchMorePosts,
     hasMorePosts,
     loadingMorePosts,

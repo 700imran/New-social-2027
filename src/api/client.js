@@ -196,6 +196,13 @@ export const getPosts = (topic, kind, before, author) => {
   return request(`/posts${qs ? `?${qs}` : ''}`)
 }
 export const searchUsers = (q) => request(`/users/search?q=${encodeURIComponent(q)}`, { auth: false })
+// Single post by id — for a post referenced by a deep link, permalink, or
+// a shared-post chat message that isn't already sitting in the locally
+// loaded feed. auth:false-equivalent (default true sends a token when one
+// exists, same reasoning as getPosts above) since the backend's
+// optionalAuth on this route means it also works for a signed-out/public
+// view.
+export const getPost = (id) => request(`/posts/${id}`)
 // payload: { body, mediaAssetId?, topic?, kind?, taggedUserIds? } — kind
 // is 'post' (default) or 'reel'; taggedUserIds is an array of user ids.
 export const createPost = (payload) => request('/posts', { method: 'POST', body: payload })
@@ -276,6 +283,20 @@ export async function getSettings() {
 export async function updateSettings(partial) {
   return request('/settings', { method: 'PATCH', body: partial })
 }
+
+// --- Direct messages (backend/src/routes/messages.js) -----------------------
+export const getConversations = () => request('/conversations')
+// Get-or-create the 1:1 conversation with `userId` — this is what
+// Profile.jsx's Message button and the Share sheet's recipient list both
+// call before they ever have a conversation id to work with.
+export const startConversation = (userId) => request('/conversations', { method: 'POST', body: { userId } })
+export const getMessages = (conversationId, before) =>
+  request(`/conversations/${conversationId}/messages${before ? `?before=${encodeURIComponent(before)}` : ''}`)
+// payload: { body? , sharedPostId? } — at least one required.
+export const sendMessage = (conversationId, payload) =>
+  request(`/conversations/${conversationId}/messages`, { method: 'POST', body: payload })
+export const deleteMessage = (messageId) => request(`/messages/${messageId}`, { method: 'DELETE' })
+export const markConversationRead = (conversationId) => request(`/conversations/${conversationId}/read`, { method: 'POST' })
 
 // --- Model 2: Commerce (dormant — schema exists, UI does not use these yet) -
 export const createCampaign = (payload) => request('/campaigns', { method: 'POST', body: payload })

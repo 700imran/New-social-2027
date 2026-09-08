@@ -12,7 +12,7 @@ import { useApp } from '../context/AppContext.jsx'
 // it here.
 export default function HomeTopNav() {
   const navigate = useNavigate()
-  const { unreadCount } = useApp()
+  const { unreadCount, unreadMessagesCount } = useApp()
 
   return (
     <header className="sticky top-0 z-40 flex items-center justify-between border-b border-ink-100 bg-white/90 px-4 py-3 backdrop-blur">
@@ -34,10 +34,15 @@ export default function HomeTopNav() {
         </button>
         <button
           onClick={() => navigate('/messages')}
-          className="focus-ring rounded-full p-1 text-ink-700 transition-transform active:scale-90"
+          className="focus-ring relative rounded-full p-1 text-ink-700 transition-transform active:scale-90"
           aria-label="Messages"
         >
           <Send className="h-5 w-5" />
+          {unreadMessagesCount > 0 && (
+            <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-bharat-red px-1 text-[9px] font-bold text-white ring-2 ring-white">
+              {unreadMessagesCount > 9 ? '9+' : unreadMessagesCount}
+            </span>
+          )}
         </button>
       </div>
     </header>

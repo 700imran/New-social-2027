@@ -29,6 +29,10 @@ was built for each.
   "coming in a future release" toast rather than a fake chat thread —
   real messaging needs its own schema (threads, participants, delivery)
   and almost certainly realtime infrastructure, well beyond a UI screen.
+  **Update:** this schema/backend/UI was built in a later pass — see
+  [`../ARCHITECTURE.md`](../ARCHITECTURE.md#direct-messages) for what
+  actually shipped and its one remaining honest limitation (no realtime
+  push — messages are fetched on open, not pushed live).
 - **Discover redesign** (`src/pages/Discover.jsx`) — subject-first topic
   tabs (Top/News/Tech/Business/Culture/Sports) replace the single hero+
   trending layout; a geographic discovery row (India/Asia/Africa/Europe/

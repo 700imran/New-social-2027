@@ -47,9 +47,10 @@ A 480px mobile-first app shell (also responsive up to desktop) covering:
   reachable from the Home top bar.
 - **Communities** — browse and join topic-based communities, reachable
   from Discover.
-- **Messages** — searchable conversation list, reachable from the Home top
-  bar (sending is not wired yet — see
-  [`../docs/PRODUCT_DIRECTION_UPDATE.md`](../docs/PRODUCT_DIRECTION_UPDATE.md)).
+- **Messages** — 1:1 chat: conversation list with unread badges, sending
+  and deleting your own messages, starting a new conversation, and sharing
+  a post/reel directly to someone from its Share button. No push/realtime
+  yet (see [`ARCHITECTURE.md`](ARCHITECTURE.md#direct-messages)).
 
 All of it is powered by `src/context/AppContext.jsx`, an in-memory store —
 refreshing the page resets state, which is expected for a frontend-only demo.

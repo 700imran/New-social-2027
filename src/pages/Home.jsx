@@ -24,10 +24,20 @@ const STORIES_PREVIEW = {
 }
 
 export default function Home() {
-  const { posts, fetchPostsLive, fetchMorePosts, hasMorePosts, loadingMorePosts } = useApp()
+  const { posts, fetchPostsLive, fetchMorePosts, hasMorePosts, loadingMorePosts, fetchConversationsLive } = useApp()
   const [activeTab, setActiveTab] = useState('For You')
   const sentinelRef = useRef(null)
   const navigate = useNavigate()
+
+  // Deliberately not part of AppContext's auth bootstrap effect — Home is
+  // the first authenticated screen almost every session actually lands
+  // on, so firing this from here (not blocking anything above it) gets
+  // HomeTopNav's unread-messages badge real data within one request of
+  // landing here, without adding a request to the critical path every
+  // session pays even when Messages never gets opened.
+  useEffect(() => {
+    fetchConversationsLive()
+  }, [fetchConversationsLive])
 
   // Reels live on their own tab/page (Reels.jsx) and Profile's Reels tab —
   // kept out of the text/photo feed here the same way a "reel" is really

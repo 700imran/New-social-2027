@@ -4,7 +4,13 @@ import Logo from './Logo.jsx'
 // The very first thing anyone sees on cold start, web or APK (same React
 // tree either way — see App.jsx). Auto-advances on its own after
 // `minDuration`; the caller doesn't need a button here, just onDone.
-export default function LaunchSplash({ onDone, minDuration = 1600 }) {
+// Trimmed from the original 1600ms — still a deliberate brand beat, not
+// a bug, but every one of those milliseconds sits directly in front of
+// a signed-out user's cold start, so it's kept to the minimum that still
+// reads as intentional rather than as the app being slow. Only ever
+// runs for signed-out visits (App.jsx's `showIntro` check) — a returning
+// signed-in user never sees this timer at all.
+export default function LaunchSplash({ onDone, minDuration = 900 }) {
   useEffect(() => {
     const t = setTimeout(() => onDone?.(), minDuration)
     return () => clearTimeout(t)

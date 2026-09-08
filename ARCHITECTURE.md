@@ -13,6 +13,7 @@ were added to make that transition a swap, not a rewrite.
 |---|---|---|---|
 | 1. User & Trust | identity, profile, follows, consent, audit | `AppContext.jsx`: `signUp`, `signIn`, `toggleFollow`, `updateProfile` — in-memory, unverified | `routes/auth.js`, `routes/users.js`, `routes/follows.js`, `routes/consent.js` — real Supabase Auth + RLS |
 | 1 (social surface) | posts/comments/reactions/notifications | `AppContext.jsx`: `createPost`, `addComment`, `toggleLike`, `notifications` state | `routes/posts.js`, `routes/notifications.js` |
+| 1 (direct messages) | 1:1 chat, sharing a post/reel into a conversation | `AppContext.jsx`: `getOrCreateConversation`, `sendMessage`, `deleteMessage`; `Messages.jsx`/`ChatThread.jsx` | `routes/messages.js`, `migrations/012_direct_messages.sql` |
 | 2. Creator–Brand Commerce | brands/campaigns/offers/deliverables/ledger | Not used by the UI — the mockup this was built from doesn't have a commerce surface | `routes/campaigns.js` — schema-complete, endpoints work, deliberately not wired to any screen, matching the guideline's "dormant until prioritized" instruction |
 | 3. Media | uploads, storage, playback | `CreatePost.jsx`: `FileReader` → base64 data URL, kept in React state only | `routes/media.js` — real presigned R2 upload URLs |
 
@@ -80,6 +81,57 @@ upload in Edit Profile all need either a schema change or new UI that
 wasn't part of this pass — each is called out in
 `../docs/CONNECT_EXISTING_INFRA.md`'s "Known gaps" section rather than
 pretending to work.
+
+## Direct messages
+
+1:1 chat (`Messages.jsx` for the conversation list, `ChatThread.jsx` for a
+thread) follows the exact same mock/live seam as everything else —
+`AppContext.jsx`'s `conversations`/`messagesByConversation` state, backed
+by `backend/src/routes/messages.js` and
+`docs/migrations/012_direct_messages.sql` when `VITE_API_BASE_URL` is set,
+or by `MOCK_MESSAGES`/`CONVERSATIONS` in `mockData.js` otherwise.
+
+Two honest notes on how this works, not a silent gap:
+
+* **No push/realtime.** A conversation's messages are fetched on open and
+  sent as a normal POST — there's no WebSocket subscription, so a reply
+  from the other person won't appear until you reopen or re-poll the
+  thread. Reasonable next step if this needs to feel instant: either a
+  short `setInterval` poll while `ChatThread.jsx` is mounted, or Supabase
+  Realtime (already available on the free tier) subscribed to the
+  `messages` table.
+* **Shared-post previews.** A message that shares a post
+  (`shared_post_id`) only stores the id — same as a permalink does. The
+  backend already had a single-post endpoint for exactly this situation
+  (`GET /posts/:id` in `routes/posts.js`, originally added for deep
+  links), it just wasn't being called from the frontend yet —
+  `AppContext.jsx`'s `fetchPostById` now does, and `PostDetail.jsx` (real
+  permalinks) and `ChatThread.jsx` (shared-post bubbles) both use it for
+  a post that isn't already in the locally-loaded `posts` array, instead
+  of only ever checking that list and calling anything else "not found."
+
+Also deliberately lazy: `conversations` is fetched from `Home.jsx`'s mount
+effect and again from `Messages.jsx`'s, not from `AppContext.jsx`'s auth
+bootstrap — a feature most individual sessions never open shouldn't add a
+network request to every app launch. See the code-splitting note below for
+the same reasoning applied to JS payload, not just requests.
+
+## Performance: route-level code splitting
+
+`App.jsx` used to import all ~30 page components eagerly, so a fresh visit
+downloaded and parsed the entire app before the first screen could paint.
+Every route is now `React.lazy()`-loaded behind a single `<Suspense>`
+boundary, with `src/utils/prefetchRoutes.js` warming the next likely
+screen(s) during idle time (the five bottom-nav destinations once signed
+in, `Welcome`/`SignUp` while a signed-out visit is still on the splash) so
+the split doesn't show up as a visible loading flash in normal use.
+`BottomNav.jsx`'s tabs additionally prefetch their own chunk on
+touch-start/hover, the same "warm it before the tap, not after" pattern
+`usePrefetchOnIntent.js` already used for comment data. Cloudflare
+Turnstile's script tag moved from an unconditional `<script>` in
+`index.html` into `TurnstileWidget.jsx` injecting it on demand, so pages
+that never render that widget (which is most of the app) no longer fetch
+it at all.
 
 ## Why the frontend doesn't call the backend by default
 

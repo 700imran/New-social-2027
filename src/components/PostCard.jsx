@@ -8,6 +8,8 @@ import MediaImage from './MediaImage.jsx'
 import ArchIllustration from './ArchIllustration.jsx'
 import ReportModal from './ReportModal.jsx'
 import WhySeeingModal from './WhySeeingModal.jsx'
+import CommentSheet from './CommentSheet.jsx'
+import ShareSheet from './ShareSheet.jsx'
 import { formatCount } from '../utils/format.js'
 
 export default function PostCard({ post, onOpen }) {
@@ -34,6 +36,8 @@ export default function PostCard({ post, onOpen }) {
   const [reportOpen, setReportOpen] = useState(false)
   const [whySeeingOpen, setWhySeeingOpen] = useState(false)
   const [showBigHeart, setShowBigHeart] = useState(false)
+  const [commentSheetOpen, setCommentSheetOpen] = useState(false)
+  const [shareSheetOpen, setShareSheetOpen] = useState(false)
   const lastTapRef = React.useRef(0)
 
   const author = getUser(post.authorId)
@@ -51,8 +55,9 @@ export default function PostCard({ post, onOpen }) {
     setTimeout(() => setJustReposted(false), 700)
   }
 
-  const handleShare = async (e) => {
-    e.stopPropagation()
+  // Native OS share sheet / clipboard fallback — offered as one row
+  // inside ShareSheet (below) alongside "send directly to a person".
+  const handleNativeShare = async () => {
     const shareData = { title: 'BharatSpace', text: post.text, url: `${window.location.origin}/post/${post.id}` }
     if (navigator.share) {
       try {
@@ -251,7 +256,11 @@ export default function PostCard({ post, onOpen }) {
           <span className={liked ? 'text-bharat-red' : ''}>{formatCount(post.likes)}</span>
         </button>
 
-        <button onClick={openPost} {...prefetchComments} className="focus-ring flex items-center gap-1.5 rounded-lg py-1 pr-2 text-xs font-medium">
+        <button
+          onClick={(e) => { e.stopPropagation(); setCommentSheetOpen(true) }}
+          {...prefetchComments}
+          className="focus-ring flex items-center gap-1.5 rounded-lg py-1 pr-2 text-xs font-medium"
+        >
           <MessageCircle className="h-[18px] w-[18px]" />
           {formatCount(post.comments)}
         </button>
@@ -265,10 +274,18 @@ export default function PostCard({ post, onOpen }) {
           <Bookmark className={`h-[18px] w-[18px] ${saved ? 'fill-navy-900 text-navy-900' : ''}`} />
         </button>
 
-        <button onClick={handleShare} className="focus-ring rounded-lg py-1">
+        <button onClick={(e) => { e.stopPropagation(); setShareSheetOpen(true) }} className="focus-ring rounded-lg py-1">
           <Share2 className="h-[18px] w-[18px]" />
         </button>
       </div>
+
+      <CommentSheet open={commentSheetOpen} onClose={() => setCommentSheetOpen(false)} postId={post.id} />
+      <ShareSheet
+        open={shareSheetOpen}
+        onClose={() => setShareSheetOpen(false)}
+        postId={post.id}
+        onNativeShare={handleNativeShare}
+      />
     </article>
   )
 }

@@ -202,13 +202,49 @@ export const COMMUNITIES = [
   { id: 'com6', name: 'Cricket Fever', members: 412000, tone: 'from-bharat-green to-bharat-greendark', joined: true, category: 'Sports' },
 ]
 
+// Chat list rows — shaped to match what mapApiConversation() produces
+// from a real backend (see src/utils/live.js), so Messages.jsx and
+// ChatThread.jsx render identically whether VITE_API_BASE_URL is set or
+// not. `lastMessage` mirrors the last entry in this same conversation's
+// MOCK_MESSAGES thread below, kept in sync by hand since mock mode has no
+// server to derive it from automatically.
 export const CONVERSATIONS = [
-  { id: 'msg1', authorId: 'ananya', preview: 'See you at the event!', time: '5m', unread: 2 },
-  { id: 'msg2', authorId: 'techBharat', preview: 'Shared a link', time: '2h', unread: 0 },
-  { id: 'msg3', authorId: 'rohit', preview: 'Great discussion today!', time: '4h', unread: 0 },
-  { id: 'msg4', authorId: 'meera', preview: '12 new messages', time: '5h', unread: 12 },
-  { id: 'msg5', authorId: 'vikram', preview: "Let's collaborate soon.", time: '2d', unread: 0 },
+  { id: 'msg1', authorId: 'ananya', lastMessage: { text: 'See you at the event!', sharedPost: false, time: '5m ago' }, unreadCount: 2 },
+  { id: 'msg2', authorId: 'techBharat', lastMessage: { text: null, sharedPost: true, time: '2h ago' }, unreadCount: 0 },
+  { id: 'msg3', authorId: 'rohit', lastMessage: { text: 'Great discussion today, learned a lot!', sharedPost: false, time: '4h ago' }, unreadCount: 0 },
+  { id: 'msg4', authorId: 'meera', lastMessage: { text: 'Are you free to catch the workshop this weekend?', sharedPost: false, time: '5h ago' }, unreadCount: 3 },
+  { id: 'msg5', authorId: 'vikram', lastMessage: { text: "Let's collaborate on something soon.", sharedPost: false, time: '2d ago' }, unreadCount: 0 },
 ]
+
+// One thread per CONVERSATIONS row, oldest message first (how a thread
+// renders top-to-bottom) — same key ('pooja') as `currentUser` elsewhere
+// in mock mode stands in for "me". `sharedPostId` references INITIAL_POSTS
+// above, demonstrating the Share-to-a-person flow (Reels.jsx/PostCard.jsx's
+// Share sheet) without needing a live backend to try it.
+export const MOCK_MESSAGES = {
+  msg1: [
+    { id: 'm1-1', senderId: 'ananya', text: 'Hey! Are you coming to the meetup on Saturday?', time: '9:14 AM' },
+    { id: 'm1-2', senderId: 'pooja', text: "Wouldn't miss it — what time does it start?", time: '9:20 AM' },
+    { id: 'm1-3', senderId: 'ananya', text: 'See you at the event!', time: '9:22 AM' },
+  ],
+  msg2: [
+    { id: 'm2-1', senderId: 'techBharat', text: "Saw this and thought of you — India's space programme thread", time: 'Yesterday' },
+    { id: 'm2-2', senderId: 'techBharat', sharedPostId: 'p2', text: null, time: '2h ago' },
+  ],
+  msg3: [
+    { id: 'm3-1', senderId: 'pooja', text: 'That panel discussion today was excellent.', time: '3h ago' },
+    { id: 'm3-2', senderId: 'rohit', text: 'Great discussion today, learned a lot!', time: '4h ago' },
+  ],
+  msg4: [
+    { id: 'm4-1', senderId: 'meera', text: 'There\'s a Bharatanatyam workshop this weekend in Chennai.', time: 'Mon' },
+    { id: 'm4-2', senderId: 'meera', text: 'A few of us are going, thought you might want to join.', time: 'Mon' },
+    { id: 'm4-3', senderId: 'meera', text: 'Are you free to catch the workshop this weekend?', time: '5h ago' },
+  ],
+  msg5: [
+    { id: 'm5-1', senderId: 'vikram', text: "Loved your last post on the tree-planting drive.", time: '2d ago' },
+    { id: 'm5-2', senderId: 'vikram', text: "Let's collaborate on something soon.", time: '2d ago' },
+  ],
+}
 
 // Vertical short-form feed. `tone` stands in for a real video background
 // the same way HIGHLIGHTS/LIVE_NOW above already use a gradient in place

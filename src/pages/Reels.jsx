@@ -2,6 +2,8 @@ import React, { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Camera, Heart, MessageCircle, Send, Bookmark, Music2 } from 'lucide-react'
 import Avatar from '../components/Avatar.jsx'
+import CommentSheet from '../components/CommentSheet.jsx'
+import ShareSheet from '../components/ShareSheet.jsx'
 import { useApp } from '../context/AppContext.jsx'
 import { REELS } from '../data/mockData.js'
 import { formatCount } from '../utils/format.js'
@@ -60,15 +62,29 @@ export default function Reels() {
   }, [allReels, activeTab, followedUserIds])
 
   return (
-    <div className="flex flex-col bg-navy-950">
-      <header className="sticky top-0 z-40 flex items-center justify-between px-4 py-3">
+    // `fixed inset-0` — full true viewport, deliberately escaping
+    // AppLayout's <Outlet/> wrapper (which reserves `pb-20` at the bottom
+    // for BottomNav) rather than living inside it. That reserved-space
+    // approach is right for normal scrolling pages, but it was exactly
+    // why reels rendered at 70% of viewport height (see the old
+    // `h-[70dvh]` on each <section>) instead of one full-screen reel per
+    // swipe — the section height was arbitrary AND the outer page still
+    // had room (and no bound) to grow taller than the viewport, so two
+    // partial reels ended up visible at once instead of one snapping
+    // cleanly to the screen. `z-30` keeps this below BottomNav/ToastStack
+    // (z-50) so the nav still floats on top like Instagram/TikTok's own
+    // reels tabs — see the `--bottom-nav-h` clearance on the action row
+    // in ReelCard below, which keeps the like/comment/share column and
+    // caption clear of that floating bar.
+    <div className="app-shell fixed inset-0 z-30 flex flex-col bg-navy-950">
+      <header className="shrink-0 flex items-center justify-between px-4 py-3">
         <h1 className="font-display text-xl font-bold text-white">Reels</h1>
         <button onClick={() => navigate('/create')} className="focus-ring rounded-full p-1" aria-label="Create a reel">
           <Camera className="h-5 w-5 text-white" />
         </button>
       </header>
 
-      <div className="flex gap-5 px-4 pb-3 text-sm font-semibold">
+      <div className="shrink-0 flex gap-5 px-4 pb-3 text-sm font-semibold">
         {TABS.map((tab) => (
           <button
             key={tab}
@@ -83,14 +99,25 @@ export default function Reels() {
       </div>
 
       {visibleReels.length === 0 ? (
-        <div className="px-6 py-20 text-center">
-          <p className="font-display text-base font-semibold text-white">No reels here yet</p>
-          <p className="mt-1 text-sm text-white/60">
-            {activeTab === 'Following' ? 'Reels from people you follow will show up here.' : 'Be the first to post one.'}
-          </p>
+        <div className="flex flex-1 items-center justify-center px-6 text-center">
+          <div>
+            <p className="font-display text-base font-semibold text-white">No reels here yet</p>
+            <p className="mt-1 text-sm text-white/60">
+              {activeTab === 'Following' ? 'Reels from people you follow will show up here.' : 'Be the first to post one.'}
+            </p>
+          </div>
         </div>
       ) : (
-        <div className="no-scrollbar snap-y snap-mandatory overflow-y-auto" style={{ scrollSnapType: 'y mandatory' }}>
+        // `min-h-0` is the part that's easy to miss and everything above
+        // depends on: without it, a flex child won't shrink below its
+        // content's natural size, so `flex-1` alone wouldn't actually
+        // bound this list to the remaining space — it'd grow to fit all
+        // the reels stacked end to end instead, and `overflow-y-auto`
+        // would have nothing to ever actually overflow.
+        <div
+          className="no-scrollbar relative flex-1 min-h-0 snap-y snap-mandatory overflow-y-auto overscroll-y-contain"
+          style={{ scrollSnapType: 'y mandatory' }}
+        >
           {visibleReels.map((reel) => (
             <ReelCard key={reel.id} reel={reel} />
           ))}
@@ -107,6 +134,8 @@ function ReelCard({ reel }) {
   const following = author ? followedUserIds.has(author.id) : false
   const liked = likedPostIds.has(reel.id)
   const saved = savedPostIds.has(reel.id)
+  const [commentSheetOpen, setCommentSheetOpen] = useState(false)
+  const [shareSheetOpen, setShareSheetOpen] = useState(false)
 
   const videoRef = React.useRef(null)
   const sectionRef = React.useRef(null)
@@ -189,16 +218,21 @@ function ReelCard({ reel }) {
   const displayLikes = reel.isRealPost ? reel.likes : reel.likes + (liked ? 1 : 0)
 
   const handleComment = () => {
-    if (reel.isRealPost) navigate(`/post/${reel.id}`)
-    else pushToast('Comments coming soon for Reels')
+    // A slide-up comment sheet needs a real post with a real
+    // comments_list to read/write (see CommentSheet.jsx) — the four
+    // static REELS fixtures in mockData.js are demo dressing, not actual
+    // posts in AppContext's `posts` array, so there's nothing for it to
+    // load for those. Once someone actually posts a reel (isRealPost),
+    // comments work exactly like a feed post's.
+    if (reel.isRealPost) setCommentSheetOpen(true)
+    else pushToast('Comments are available on reels you or others have posted')
   }
 
-  // Was previously a fake "Link copied to clipboard" toast with nothing
-  // actually copied — same class of bug the Copy Link fix elsewhere in
-  // this app already addressed, just missed here. Mirrors PostCard's
-  // handleShare: only a real, real post has a real URL to share.
-  const handleShare = async (e) => {
-    e.stopPropagation()
+  // Native OS share sheet / clipboard fallback — offered from ShareSheet
+  // for real reels, and directly (no person-picker) for the static demo
+  // reels below, which have no real postId to attach a shared-post
+  // message to.
+  const handleNativeShare = async () => {
     const shareData = {
       title: 'BharatSpace',
       text: reel.caption || 'Check this out on BharatSpace',
@@ -222,10 +256,16 @@ function ReelCard({ reel }) {
     }
   }
 
+  const handleShareClick = (e) => {
+    e.stopPropagation()
+    if (reel.isRealPost) setShareSheetOpen(true)
+    else handleNativeShare()
+  }
+
   return (
     <section
       ref={sectionRef}
-      className={`relative flex h-[70dvh] w-full shrink-0 snap-start items-end overflow-hidden bg-gradient-to-br ${reel.tone}`}
+      className={`relative flex h-full w-full items-end overflow-hidden bg-gradient-to-br ${reel.tone}`}
       style={{ scrollSnapAlign: 'start' }}
     >
       {reel.mediaUrl && (
@@ -277,7 +317,10 @@ function ReelCard({ reel }) {
         </button>
       )}
 
-      <div className="relative z-10 flex w-full items-end justify-between gap-3 p-4 pb-6">
+      <div
+        className="relative z-10 flex w-full items-end justify-between gap-3 p-4"
+        style={{ paddingBottom: 'calc(var(--bottom-nav-h) + 14px)' }}
+      >
         <div className="min-w-0 flex-1 text-white">
           {author && (
             <div className="flex items-center gap-2">
@@ -315,12 +358,24 @@ function ReelCard({ reel }) {
               <Bookmark className={`h-6 w-6 ${saved ? 'fill-white' : ''}`} />
             </button>
           )}
-          <button onClick={handleShare} className="focus-ring flex flex-col items-center gap-1">
+          <button onClick={handleShareClick} className="focus-ring flex flex-col items-center gap-1">
             <Send className="h-6 w-6" />
             <span className="text-[11px] font-semibold">{formatCount(reel.shares)}</span>
           </button>
         </div>
       </div>
+
+      {reel.isRealPost && (
+        <>
+          <CommentSheet open={commentSheetOpen} onClose={() => setCommentSheetOpen(false)} postId={reel.id} />
+          <ShareSheet
+            open={shareSheetOpen}
+            onClose={() => setShareSheetOpen(false)}
+            postId={reel.id}
+            onNativeShare={handleNativeShare}
+          />
+        </>
+      )}
     </section>
   )
 }

@@ -207,3 +207,58 @@ export function decodeJwtPayload(token) {
 export function isEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
+
+// Chat bubbles show a clock time ("10:32 AM", "Yesterday", "Mar 4"), not
+// a relative "3h ago" — timeAgo() above reads naturally for a feed or
+// notification row; a message thread reads the way every texting app
+// already shows it.
+export function clockTime(isoString) {
+  if (!isoString) return ''
+  const d = new Date(isoString)
+  const now = new Date()
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
+  }
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday'
+  const sameYear = d.getFullYear() === now.getFullYear()
+  return d.toLocaleDateString('en-US', sameYear ? { month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+// backend/src/routes/messages.js GET /conversations -> one row per 1:1
+// thread, newest-activity-first (already sorted server-side). Shaped
+// like mapApiPost: `authorId` is what the rest of the app reads through
+// getUser(), `_author` is the fragment that gets cached so getUser()
+// actually has something to resolve it to (see AppContext.jsx's
+// fetchConversationsLive).
+export function mapApiConversation(apiConvo) {
+  return {
+    id: apiConvo.id,
+    authorId: apiConvo.otherUser?.id || null,
+    lastMessage: apiConvo.lastMessage
+      ? {
+          text: apiConvo.lastMessage.body || null,
+          sharedPost: !!apiConvo.lastMessage.sharedPost,
+          time: timeAgo(apiConvo.lastMessage.createdAt),
+        }
+      : null,
+    unreadCount: apiConvo.unreadCount ?? 0,
+    _updatedAt: apiConvo.updatedAt,
+    _author: mapAuthorFragment(apiConvo.otherUser),
+  }
+}
+
+// backend/src/routes/messages.js GET /conversations/:id/messages -> one
+// row per message, oldest-first (see that route's own comment on why).
+export function mapApiMessage(apiMessage) {
+  return {
+    id: apiMessage.id,
+    conversationId: apiMessage.conversation_id,
+    senderId: apiMessage.sender_id,
+    text: apiMessage.body || null,
+    sharedPostId: apiMessage.shared_post_id || null,
+    time: clockTime(apiMessage.created_at),
+    _createdAt: apiMessage.created_at,
+  }
+}
