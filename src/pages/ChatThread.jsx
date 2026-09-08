@@ -4,6 +4,7 @@ import { Send, Trash2 } from 'lucide-react'
 import PageHeader from '../components/PageHeader.jsx'
 import Avatar from '../components/Avatar.jsx'
 import { useApp } from '../context/AppContext.jsx'
+import { useKeyboardInset } from '../utils/useKeyboardInset.js'
 
 // The actual chat screen — reached two ways: Messages.jsx's list (tap a
 // conversation) and Profile.jsx's Message button
@@ -35,6 +36,7 @@ export default function ChatThread() {
   const [openMenuId, setOpenMenuId] = useState(null)
   const scrollRef = useRef(null)
   const otherUser = getUser(userId)
+  const keyboardInset = useKeyboardInset()
 
   useEffect(() => {
     let cancelled = false
@@ -78,7 +80,7 @@ export default function ChatThread() {
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
-  }, [messages.length])
+  }, [messages.length, keyboardInset])
 
   const handleSend = (e) => {
     e.preventDefault()
@@ -114,7 +116,17 @@ export default function ChatThread() {
     // (see that file's comment), so a child asking for 100% of it lands
     // exactly at "the visible area above the nav" without hardcoding a
     // second copy of that math here.
-    <div className="flex h-full flex-col">
+    <div
+      // At rest this already sits correctly (h-full resolves to the
+      // space AppLayout reserves above BottomNav — see the comment
+      // above). When Gboard opens, `keyboardInset` shifts the whole
+      // column up by exactly its height so the message input ends up
+      // resting on top of the keyboard instead of being hidden under
+      // it; it settles back to its normal spot the instant the
+      // keyboard closes and `keyboardInset` returns to 0.
+      className="flex h-full flex-col transition-transform duration-150"
+      style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
+    >
       <PageHeader
         title={
           <button

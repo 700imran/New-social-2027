@@ -8,6 +8,7 @@ import CommentRow from '../components/CommentRow.jsx'
 import ShareSheet from '../components/ShareSheet.jsx'
 import { useApp } from '../context/AppContext.jsx'
 import { formatCount } from '../utils/format.js'
+import { useKeyboardInset } from '../utils/useKeyboardInset.js'
 
 export default function PostDetail() {
   const { id } = useParams()
@@ -31,6 +32,7 @@ export default function PostDetail() {
   const [comment, setComment] = useState('')
   const [shareSheetOpen, setShareSheetOpen] = useState(false)
   const [resolving, setResolving] = useState(true)
+  const keyboardInset = useKeyboardInset()
 
   useEffect(() => {
     loadComments(id)
@@ -121,7 +123,14 @@ export default function PostDetail() {
     <div className="flex min-h-dvh flex-col">
       <PageHeader title="Post" showBack />
 
-      <div className="flex-1 overflow-y-auto pb-24">
+      <div
+        className="flex-1 overflow-y-auto"
+        // Comment composer (~76px incl. its own padding/border) sits
+        // directly above BottomNav now instead of overlapping it (see
+        // the form below), so the scrollable area needs clearance for
+        // *both*, stacked, not just the nav on its own.
+        style={{ paddingBottom: 'calc(var(--bottom-nav-h) + 76px)' }}
+      >
         <div className="border-b border-ink-100 px-4 py-4">
           <div className="flex items-center gap-3">
             <button
@@ -214,7 +223,16 @@ export default function PostDetail() {
 
       <form
         onSubmit={handleSend}
-        className="app-shell fixed bottom-0 left-1/2 z-40 flex w-full max-w-[480px] -translate-x-1/2 items-center gap-2 border-t border-ink-100 bg-white px-3 py-2.5"
+        // Rests with its bottom edge touching BottomNav's top edge
+        // (`var(--bottom-nav-h)`, not `bottom-0`) so the nav — a sibling
+        // fixed element with a higher z-index — never renders on top of
+        // it and hides it. The instant Gboard opens, `keyboardInset`
+        // (see useKeyboardInset.js) reports how many px it covers and
+        // this switches to sitting right above the keyboard instead;
+        // it drops back to resting on the nav the moment the keyboard
+        // closes and `keyboardInset` returns to 0.
+        style={{ bottom: keyboardInset > 0 ? `${keyboardInset}px` : 'var(--bottom-nav-h)' }}
+        className="app-shell fixed left-1/2 z-40 flex w-full max-w-[480px] -translate-x-1/2 items-center gap-2 border-t border-ink-100 bg-white px-3 py-2.5 transition-[bottom] duration-150"
       >
         <Avatar user={currentUser} size="xs" />
         <input

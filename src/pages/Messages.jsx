@@ -4,6 +4,7 @@ import { Search, SquarePen, X } from 'lucide-react'
 import PageHeader from '../components/PageHeader.jsx'
 import Avatar from '../components/Avatar.jsx'
 import { useApp } from '../context/AppContext.jsx'
+import { useKeyboardInset } from '../utils/useKeyboardInset.js'
 
 export default function Messages() {
   const { getUser, conversations, conversationsLoaded, fetchConversationsLive, currentUser } = useApp()
@@ -124,6 +125,7 @@ function NewMessageSheet({ currentUserId, onClose, onPick }) {
   const { followedUserIds, getUser, searchUsers, directory } = useApp()
   const [query, setQuery] = useState('')
   const [searchResults, setSearchResults] = useState([])
+  const keyboardInset = useKeyboardInset()
 
   useEffect(() => {
     const q = query.trim()
@@ -161,7 +163,14 @@ function NewMessageSheet({ currentUserId, onClose, onPick }) {
   return (
     <>
       <div className="fixed inset-0 z-[60] bg-black/40" onClick={onClose} />
-      <div className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp">
+      <div
+        // Same fix as ShareSheet.jsx: the search field here autoFocuses
+        // (opens Gboard immediately on mount), so this needs the same
+        // keyboard-aware lift to keep the people list from ending up
+        // partly hidden behind the keyboard.
+        className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp transition-transform duration-150"
+        style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
+      >
         <div className="flex items-center justify-between border-b border-ink-100 px-4 py-3">
           <p className="font-display text-base font-semibold text-ink-900">New message</p>
           <button onClick={onClose} className="focus-ring rounded-full p-1 text-ink-500" aria-label="Close">

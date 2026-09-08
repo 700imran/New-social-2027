@@ -3,6 +3,7 @@ import { X, Send } from 'lucide-react'
 import Avatar from './Avatar.jsx'
 import CommentRow from './CommentRow.jsx'
 import { useApp } from '../context/AppContext.jsx'
+import { useKeyboardInset } from '../utils/useKeyboardInset.js'
 
 // The slide-up comment sheet opened by tapping the comment icon on a
 // post (PostCard.jsx) or a reel (Reels.jsx) — previously the only way to
@@ -15,6 +16,7 @@ export default function CommentSheet({ open, onClose, postId }) {
   const { posts, getUser, currentUser, likedCommentIds, toggleCommentLike, deleteComment, setPinnedComment, addComment, loadComments } =
     useApp()
   const [text, setText] = useState('')
+  const keyboardInset = useKeyboardInset()
 
   useEffect(() => {
     if (open && postId) loadComments(postId)
@@ -39,7 +41,17 @@ export default function CommentSheet({ open, onClose, postId }) {
   return (
     <>
       <div className="fixed inset-0 z-[60] bg-black/40" onClick={onClose} />
-      <div className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex h-[85dvh] w-full flex-col rounded-t-2xl bg-white shadow-2xl animate-slideUp">
+      <div
+        // Already sits above BottomNav at rest (z-60 > BottomNav's z-50).
+        // The one gap that was missing: `85dvh` doesn't reliably shrink
+        // with an on-screen keyboard across every Android WebView this
+        // ships in, so without this the keyboard could still ride up
+        // over the comment input/Send button at the bottom of the sheet.
+        // Shifting the sheet up by `keyboardInset` the instant Gboard
+        // opens keeps the input resting on top of the keyboard instead.
+        className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex h-[85dvh] w-full flex-col rounded-t-2xl bg-white shadow-2xl animate-slideUp transition-transform duration-150"
+        style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
+      >
         <div className="flex shrink-0 items-center justify-between border-b border-ink-100 px-4 py-3">
           <p className="font-display text-base font-semibold text-ink-900">
             {post.comments} comment{post.comments === 1 ? '' : 's'}

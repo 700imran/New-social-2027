@@ -43,6 +43,7 @@ export default function Profile() {
     toggleBlock,
     loadUserProfile,
     loadUserPosts,
+    pushToast,
   } = useApp()
   const navigate = useNavigate()
   const location = useLocation()
@@ -137,6 +138,13 @@ export default function Profile() {
     }
   }, [activeContentTab, targetId, getTaggedPosts])
 
+  // Previously silent in two of its three branches — if navigator.share
+  // was unavailable (common in the Capacitor Android WebView, which
+  // doesn't implement the Web Share API on every OS version) and the
+  // clipboard write either succeeded or failed, nothing told the user
+  // anything happened, so the button looked broken even when the copy
+  // actually worked. Now mirrors PostDetail.jsx's already-correct
+  // handleNativeShare: every branch ends in visible feedback.
   const handleShare = async () => {
     if (!profileUser) return
     const shareData = {
@@ -147,15 +155,25 @@ export default function Profile() {
     if (navigator.share) {
       try {
         await navigator.share(shareData)
-      } catch {
-        /* cancelled */
+      } catch (err) {
+        // AbortError = the user cancelled the native share sheet
+        // themselves — that's a normal outcome, not a failure, so it
+        // gets no toast. Anything else (e.g. NotAllowedError on some
+        // WebView builds) is a real failure and should say so rather
+        // than leaving the button looking like it did nothing.
+        if (err?.name !== 'AbortError') {
+          pushToast('Could not open the share sheet — try again')
+        }
       }
     } else if (navigator.clipboard?.writeText) {
       try {
         await navigator.clipboard.writeText(shareData.url)
+        pushToast('Profile link copied to clipboard')
       } catch {
-        /* no-op */
+        pushToast('Could not copy link — try again')
       }
+    } else {
+      pushToast('Sharing is not supported on this device')
     }
   }
 

@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react'
 import { X, Link2, Share2, Check, Search } from 'lucide-react'
 import Avatar from './Avatar.jsx'
 import { useApp } from '../context/AppContext.jsx'
+import { useKeyboardInset } from '../utils/useKeyboardInset.js'
 
 // The "Send to..." sheet opened from a post/reel's Share button — sliding
 // up from the bottom (see the unused `slideUp` keyframe in
@@ -23,6 +24,7 @@ export default function ShareSheet({ open, onClose, postId, onNativeShare }) {
   const [query, setQuery] = useState('')
   const [selectedIds, setSelectedIds] = useState(new Set())
   const [sending, setSending] = useState(false)
+  const keyboardInset = useKeyboardInset()
 
   const candidates = useMemo(() => {
     const ids = new Set([...conversations.map((c) => c.authorId), ...followedUserIds])
@@ -73,7 +75,20 @@ export default function ShareSheet({ open, onClose, postId, onNativeShare }) {
   return (
     <>
       <div className="fixed inset-0 z-[60] bg-black/40" onClick={handleClose} />
-      <div className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp">
+      <div
+        // This is the fix for "Send is there but invisible": the
+        // "Search people…" field above opens Gboard, and on the Android
+        // WebView this ships in, `80dvh` doesn't reliably shrink to
+        // account for it — so the keyboard could sit directly on top of
+        // the Send button that appears once you've picked someone,
+        // covering it completely even though it's rendered and enabled.
+        // Shifting the whole sheet up by `keyboardInset` the moment the
+        // keyboard opens keeps Send above it; it settles back to resting
+        // on top of BottomNav (already correct, via z-60 > the nav's
+        // z-50) the instant the keyboard closes.
+        className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp transition-transform duration-150"
+        style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
+      >
         <div className="flex items-center justify-between border-b border-ink-100 px-4 py-3">
           <p className="font-display text-base font-semibold text-ink-900">Share to</p>
           <button onClick={handleClose} className="focus-ring rounded-full p-1 text-ink-500" aria-label="Close">

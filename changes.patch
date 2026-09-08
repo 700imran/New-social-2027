@@ -1,0 +1,381 @@
+diff --git a/android/android/app/src/main/AndroidManifest.xml b/android/android/app/src/main/AndroidManifest.xml
+index aa504ab..3e988f2 100644
+--- a/android/android/app/src/main/AndroidManifest.xml
++++ b/android/android/app/src/main/AndroidManifest.xml
+@@ -14,6 +14,7 @@
+             android:label="@string/title_activity_main"
+             android:theme="@style/AppTheme.NoActionBarLaunch"
+             android:launchMode="singleTask"
++            android:windowSoftInputMode="adjustResize"
+             android:exported="true">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+diff --git a/src/components/BottomNav.jsx b/src/components/BottomNav.jsx
+index 79bf90d..f4a7af8 100644
+--- a/src/components/BottomNav.jsx
++++ b/src/components/BottomNav.jsx
+@@ -3,8 +3,12 @@ import { NavLink } from 'react-router-dom'
+ import { Home, Search, Plus, Clapperboard, User } from 'lucide-react'
+ import { usePrefetchOnIntent } from '../utils/usePrefetchOnIntent.js'
+ 
++// py-1.5 (not the previous py-2) shaves a few px off each tab's own
++// padding — combined with the nav's pt-0.5 below this keeps the bar
++// visibly slimmer while the tap target (icon + label + this padding)
++// still clears the ~48px touch-target guideline.
+ const linkBase =
+-  'flex flex-col items-center justify-center gap-1 flex-1 py-2 text-[11px] font-medium transition-colors focus-ring rounded-lg'
++  'flex flex-col items-center justify-center gap-1 flex-1 py-1.5 text-[11px] font-medium transition-colors focus-ring rounded-lg'
+ 
+ export default function BottomNav() {
+   // Warms each tab's route chunk the instant a finger touches down on it
+@@ -19,7 +23,7 @@ export default function BottomNav() {
+   const prefetchProfile = usePrefetchOnIntent(() => import('../pages/Profile.jsx'))
+ 
+   return (
+-    <nav className="app-shell fixed bottom-0 left-1/2 z-50 w-full max-w-[480px] -translate-x-1/2 border-t border-ink-100 bg-white/95 backdrop-blur px-1 pb-[max(env(safe-area-inset-bottom),6px)] pt-1">
++    <nav className="app-shell fixed bottom-0 left-1/2 z-50 w-full max-w-[480px] -translate-x-1/2 border-t border-ink-100 bg-white/95 backdrop-blur px-1 pb-[max(env(safe-area-inset-bottom),6px)] pt-0.5">
+       <div className="flex items-center">
+         <NavLink
+           to="/home"
+diff --git a/src/components/CommentSheet.jsx b/src/components/CommentSheet.jsx
+index 543aef9..356bc3f 100644
+--- a/src/components/CommentSheet.jsx
++++ b/src/components/CommentSheet.jsx
+@@ -3,6 +3,7 @@ import { X, Send } from 'lucide-react'
+ import Avatar from './Avatar.jsx'
+ import CommentRow from './CommentRow.jsx'
+ import { useApp } from '../context/AppContext.jsx'
++import { useKeyboardInset } from '../utils/useKeyboardInset.js'
+ 
+ // The slide-up comment sheet opened by tapping the comment icon on a
+ // post (PostCard.jsx) or a reel (Reels.jsx) — previously the only way to
+@@ -15,6 +16,7 @@ export default function CommentSheet({ open, onClose, postId }) {
+   const { posts, getUser, currentUser, likedCommentIds, toggleCommentLike, deleteComment, setPinnedComment, addComment, loadComments } =
+     useApp()
+   const [text, setText] = useState('')
++  const keyboardInset = useKeyboardInset()
+ 
+   useEffect(() => {
+     if (open && postId) loadComments(postId)
+@@ -39,7 +41,17 @@ export default function CommentSheet({ open, onClose, postId }) {
+   return (
+     <>
+       <div className="fixed inset-0 z-[60] bg-black/40" onClick={onClose} />
+-      <div className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex h-[85dvh] w-full flex-col rounded-t-2xl bg-white shadow-2xl animate-slideUp">
++      <div
++        // Already sits above BottomNav at rest (z-60 > BottomNav's z-50).
++        // The one gap that was missing: `85dvh` doesn't reliably shrink
++        // with an on-screen keyboard across every Android WebView this
++        // ships in, so without this the keyboard could still ride up
++        // over the comment input/Send button at the bottom of the sheet.
++        // Shifting the sheet up by `keyboardInset` the instant Gboard
++        // opens keeps the input resting on top of the keyboard instead.
++        className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex h-[85dvh] w-full flex-col rounded-t-2xl bg-white shadow-2xl animate-slideUp transition-transform duration-150"
++        style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
++      >
+         <div className="flex shrink-0 items-center justify-between border-b border-ink-100 px-4 py-3">
+           <p className="font-display text-base font-semibold text-ink-900">
+             {post.comments} comment{post.comments === 1 ? '' : 's'}
+diff --git a/src/components/ShareSheet.jsx b/src/components/ShareSheet.jsx
+index 83ad81d..612f8ff 100644
+--- a/src/components/ShareSheet.jsx
++++ b/src/components/ShareSheet.jsx
+@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react'
+ import { X, Link2, Share2, Check, Search } from 'lucide-react'
+ import Avatar from './Avatar.jsx'
+ import { useApp } from '../context/AppContext.jsx'
++import { useKeyboardInset } from '../utils/useKeyboardInset.js'
+ 
+ // The "Send to..." sheet opened from a post/reel's Share button — sliding
+ // up from the bottom (see the unused `slideUp` keyframe in
+@@ -23,6 +24,7 @@ export default function ShareSheet({ open, onClose, postId, onNativeShare }) {
+   const [query, setQuery] = useState('')
+   const [selectedIds, setSelectedIds] = useState(new Set())
+   const [sending, setSending] = useState(false)
++  const keyboardInset = useKeyboardInset()
+ 
+   const candidates = useMemo(() => {
+     const ids = new Set([...conversations.map((c) => c.authorId), ...followedUserIds])
+@@ -73,7 +75,20 @@ export default function ShareSheet({ open, onClose, postId, onNativeShare }) {
+   return (
+     <>
+       <div className="fixed inset-0 z-[60] bg-black/40" onClick={handleClose} />
+-      <div className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp">
++      <div
++        // This is the fix for "Send is there but invisible": the
++        // "Search people…" field above opens Gboard, and on the Android
++        // WebView this ships in, `80dvh` doesn't reliably shrink to
++        // account for it — so the keyboard could sit directly on top of
++        // the Send button that appears once you've picked someone,
++        // covering it completely even though it's rendered and enabled.
++        // Shifting the whole sheet up by `keyboardInset` the moment the
++        // keyboard opens keeps Send above it; it settles back to resting
++        // on top of BottomNav (already correct, via z-60 > the nav's
++        // z-50) the instant the keyboard closes.
++        className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp transition-transform duration-150"
++        style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
++      >
+         <div className="flex items-center justify-between border-b border-ink-100 px-4 py-3">
+           <p className="font-display text-base font-semibold text-ink-900">Share to</p>
+           <button onClick={handleClose} className="focus-ring rounded-full p-1 text-ink-500" aria-label="Close">
+diff --git a/src/index.css b/src/index.css
+index 60153f6..bd88335 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -7,9 +7,11 @@
+     /* BottomNav.jsx's actual rendered height (icon + label + its own
+        padding, safe-area aside) — kept as one shared number so anything
+        that needs to sit clear of the floating bottom nav (Reels.jsx's
+-       fixed full-screen layout) doesn't hardcode a second copy that can
+-       drift out of sync if BottomNav's own padding ever changes. */
+-    --bottom-nav-h: 64px;
++       fixed full-screen layout, PostDetail.jsx's comment composer)
++       doesn't hardcode a second copy that can drift out of sync if
++       BottomNav's own padding ever changes. Updated to 56px to match
++       BottomNav's slimmer vertical padding. */
++    --bottom-nav-h: 56px;
+   }
+ 
+   * {
+diff --git a/src/pages/ChatThread.jsx b/src/pages/ChatThread.jsx
+index 0f53b59..7869f26 100644
+--- a/src/pages/ChatThread.jsx
++++ b/src/pages/ChatThread.jsx
+@@ -4,6 +4,7 @@ import { Send, Trash2 } from 'lucide-react'
+ import PageHeader from '../components/PageHeader.jsx'
+ import Avatar from '../components/Avatar.jsx'
+ import { useApp } from '../context/AppContext.jsx'
++import { useKeyboardInset } from '../utils/useKeyboardInset.js'
+ 
+ // The actual chat screen — reached two ways: Messages.jsx's list (tap a
+ // conversation) and Profile.jsx's Message button
+@@ -35,6 +36,7 @@ export default function ChatThread() {
+   const [openMenuId, setOpenMenuId] = useState(null)
+   const scrollRef = useRef(null)
+   const otherUser = getUser(userId)
++  const keyboardInset = useKeyboardInset()
+ 
+   useEffect(() => {
+     let cancelled = false
+@@ -78,7 +80,7 @@ export default function ChatThread() {
+ 
+   useEffect(() => {
+     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
+-  }, [messages.length])
++  }, [messages.length, keyboardInset])
+ 
+   const handleSend = (e) => {
+     e.preventDefault()
+@@ -114,7 +116,17 @@ export default function ChatThread() {
+     // (see that file's comment), so a child asking for 100% of it lands
+     // exactly at "the visible area above the nav" without hardcoding a
+     // second copy of that math here.
+-    <div className="flex h-full flex-col">
++    <div
++      // At rest this already sits correctly (h-full resolves to the
++      // space AppLayout reserves above BottomNav — see the comment
++      // above). When Gboard opens, `keyboardInset` shifts the whole
++      // column up by exactly its height so the message input ends up
++      // resting on top of the keyboard instead of being hidden under
++      // it; it settles back to its normal spot the instant the
++      // keyboard closes and `keyboardInset` returns to 0.
++      className="flex h-full flex-col transition-transform duration-150"
++      style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
++    >
+       <PageHeader
+         title={
+           <button
+diff --git a/src/pages/Messages.jsx b/src/pages/Messages.jsx
+index 3f30202..6254830 100644
+--- a/src/pages/Messages.jsx
++++ b/src/pages/Messages.jsx
+@@ -4,6 +4,7 @@ import { Search, SquarePen, X } from 'lucide-react'
+ import PageHeader from '../components/PageHeader.jsx'
+ import Avatar from '../components/Avatar.jsx'
+ import { useApp } from '../context/AppContext.jsx'
++import { useKeyboardInset } from '../utils/useKeyboardInset.js'
+ 
+ export default function Messages() {
+   const { getUser, conversations, conversationsLoaded, fetchConversationsLive, currentUser } = useApp()
+@@ -124,6 +125,7 @@ function NewMessageSheet({ currentUserId, onClose, onPick }) {
+   const { followedUserIds, getUser, searchUsers, directory } = useApp()
+   const [query, setQuery] = useState('')
+   const [searchResults, setSearchResults] = useState([])
++  const keyboardInset = useKeyboardInset()
+ 
+   useEffect(() => {
+     const q = query.trim()
+@@ -161,7 +163,14 @@ function NewMessageSheet({ currentUserId, onClose, onPick }) {
+   return (
+     <>
+       <div className="fixed inset-0 z-[60] bg-black/40" onClick={onClose} />
+-      <div className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp">
++      <div
++        // Same fix as ShareSheet.jsx: the search field here autoFocuses
++        // (opens Gboard immediately on mount), so this needs the same
++        // keyboard-aware lift to keep the people list from ending up
++        // partly hidden behind the keyboard.
++        className="app-shell fixed inset-x-0 bottom-0 z-[60] mx-auto flex max-h-[80dvh] w-full flex-col rounded-t-2xl bg-white pb-[max(env(safe-area-inset-bottom),12px)] shadow-2xl animate-slideUp transition-transform duration-150"
++        style={{ transform: keyboardInset > 0 ? `translateY(-${keyboardInset}px)` : 'none' }}
++      >
+         <div className="flex items-center justify-between border-b border-ink-100 px-4 py-3">
+           <p className="font-display text-base font-semibold text-ink-900">New message</p>
+           <button onClick={onClose} className="focus-ring rounded-full p-1 text-ink-500" aria-label="Close">
+diff --git a/src/pages/PostDetail.jsx b/src/pages/PostDetail.jsx
+index 1032b73..88aef04 100644
+--- a/src/pages/PostDetail.jsx
++++ b/src/pages/PostDetail.jsx
+@@ -8,6 +8,7 @@ import CommentRow from '../components/CommentRow.jsx'
+ import ShareSheet from '../components/ShareSheet.jsx'
+ import { useApp } from '../context/AppContext.jsx'
+ import { formatCount } from '../utils/format.js'
++import { useKeyboardInset } from '../utils/useKeyboardInset.js'
+ 
+ export default function PostDetail() {
+   const { id } = useParams()
+@@ -31,6 +32,7 @@ export default function PostDetail() {
+   const [comment, setComment] = useState('')
+   const [shareSheetOpen, setShareSheetOpen] = useState(false)
+   const [resolving, setResolving] = useState(true)
++  const keyboardInset = useKeyboardInset()
+ 
+   useEffect(() => {
+     loadComments(id)
+@@ -121,7 +123,14 @@ export default function PostDetail() {
+     <div className="flex min-h-dvh flex-col">
+       <PageHeader title="Post" showBack />
+ 
+-      <div className="flex-1 overflow-y-auto pb-24">
++      <div
++        className="flex-1 overflow-y-auto"
++        // Comment composer (~76px incl. its own padding/border) sits
++        // directly above BottomNav now instead of overlapping it (see
++        // the form below), so the scrollable area needs clearance for
++        // *both*, stacked, not just the nav on its own.
++        style={{ paddingBottom: 'calc(var(--bottom-nav-h) + 76px)' }}
++      >
+         <div className="border-b border-ink-100 px-4 py-4">
+           <div className="flex items-center gap-3">
+             <button
+@@ -214,7 +223,16 @@ export default function PostDetail() {
+ 
+       <form
+         onSubmit={handleSend}
+-        className="app-shell fixed bottom-0 left-1/2 z-40 flex w-full max-w-[480px] -translate-x-1/2 items-center gap-2 border-t border-ink-100 bg-white px-3 py-2.5"
++        // Rests with its bottom edge touching BottomNav's top edge
++        // (`var(--bottom-nav-h)`, not `bottom-0`) so the nav — a sibling
++        // fixed element with a higher z-index — never renders on top of
++        // it and hides it. The instant Gboard opens, `keyboardInset`
++        // (see useKeyboardInset.js) reports how many px it covers and
++        // this switches to sitting right above the keyboard instead;
++        // it drops back to resting on the nav the moment the keyboard
++        // closes and `keyboardInset` returns to 0.
++        style={{ bottom: keyboardInset > 0 ? `${keyboardInset}px` : 'var(--bottom-nav-h)' }}
++        className="app-shell fixed left-1/2 z-40 flex w-full max-w-[480px] -translate-x-1/2 items-center gap-2 border-t border-ink-100 bg-white px-3 py-2.5 transition-[bottom] duration-150"
+       >
+         <Avatar user={currentUser} size="xs" />
+         <input
+diff --git a/src/pages/Profile.jsx b/src/pages/Profile.jsx
+index 9424a0b..58a25fc 100644
+--- a/src/pages/Profile.jsx
++++ b/src/pages/Profile.jsx
+@@ -43,6 +43,7 @@ export default function Profile() {
+     toggleBlock,
+     loadUserProfile,
+     loadUserPosts,
++    pushToast,
+   } = useApp()
+   const navigate = useNavigate()
+   const location = useLocation()
+@@ -137,6 +138,13 @@ export default function Profile() {
+     }
+   }, [activeContentTab, targetId, getTaggedPosts])
+ 
++  // Previously silent in two of its three branches — if navigator.share
++  // was unavailable (common in the Capacitor Android WebView, which
++  // doesn't implement the Web Share API on every OS version) and the
++  // clipboard write either succeeded or failed, nothing told the user
++  // anything happened, so the button looked broken even when the copy
++  // actually worked. Now mirrors PostDetail.jsx's already-correct
++  // handleNativeShare: every branch ends in visible feedback.
+   const handleShare = async () => {
+     if (!profileUser) return
+     const shareData = {
+@@ -147,15 +155,25 @@ export default function Profile() {
+     if (navigator.share) {
+       try {
+         await navigator.share(shareData)
+-      } catch {
+-        /* cancelled */
++      } catch (err) {
++        // AbortError = the user cancelled the native share sheet
++        // themselves — that's a normal outcome, not a failure, so it
++        // gets no toast. Anything else (e.g. NotAllowedError on some
++        // WebView builds) is a real failure and should say so rather
++        // than leaving the button looking like it did nothing.
++        if (err?.name !== 'AbortError') {
++          pushToast('Could not open the share sheet — try again')
++        }
+       }
+     } else if (navigator.clipboard?.writeText) {
+       try {
+         await navigator.clipboard.writeText(shareData.url)
++        pushToast('Profile link copied to clipboard')
+       } catch {
+-        /* no-op */
++        pushToast('Could not copy link — try again')
+       }
++    } else {
++      pushToast('Sharing is not supported on this device')
+     }
+   }
+ 
+diff --git a/src/utils/useKeyboardInset.js b/src/utils/useKeyboardInset.js
+new file mode 100644
+index 0000000..0f01f1e
+--- /dev/null
++++ b/src/utils/useKeyboardInset.js
+@@ -0,0 +1,43 @@
++import { useEffect, useState } from 'react'
++
++// Tracks how many pixels of the viewport are currently covered by an
++// on-screen keyboard (Gboard, etc.), using the VisualViewport API.
++// Returns 0 whenever the keyboard is closed.
++//
++// Why this exists instead of trusting `dvh`/`svh` alone: those units are
++// *supposed* to shrink when a soft keyboard opens, but that behavior is
++// inconsistent across the Android WebView versions this app ships inside
++// via Capacitor — some resize the layout viewport, some don't, and the
++// gap between "should work" and "actually works on this device" is
++// exactly where a chat/comment input ends up hidden behind the keyboard.
++// Listening to `visualViewport` directly is the one mechanism that's
++// reliable everywhere the API exists, and callers get 0 (i.e. "keyboard
++// closed") on the rare browser that lacks it entirely, which is a safe
++// default — they just fall back to their normal resting position.
++export function useKeyboardInset() {
++  const [inset, setInset] = useState(0)
++
++  useEffect(() => {
++    const vv = window.visualViewport
++    if (!vv) return undefined
++
++    const update = () => {
++      // Anything no longer visible between the layout viewport and the
++      // visual viewport is either the keyboard or (on iOS) address-bar
++      // chrome — clamped to 0 so a sub-pixel rounding blip never reports
++      // a negative inset that would push the input the wrong way.
++      const covered = window.innerHeight - vv.height - vv.offsetTop
++      setInset(Math.max(0, Math.round(covered)))
++    }
++
++    update()
++    vv.addEventListener('resize', update)
++    vv.addEventListener('scroll', update)
++    return () => {
++      vv.removeEventListener('resize', update)
++      vv.removeEventListener('scroll', update)
++    }
++  }, [])
++
++  return inset
++}

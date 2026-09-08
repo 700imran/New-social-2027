@@ -3,8 +3,12 @@ import { NavLink } from 'react-router-dom'
 import { Home, Search, Plus, Clapperboard, User } from 'lucide-react'
 import { usePrefetchOnIntent } from '../utils/usePrefetchOnIntent.js'
 
+// py-1.5 (not the previous py-2) shaves a few px off each tab's own
+// padding — combined with the nav's pt-0.5 below this keeps the bar
+// visibly slimmer while the tap target (icon + label + this padding)
+// still clears the ~48px touch-target guideline.
 const linkBase =
-  'flex flex-col items-center justify-center gap-1 flex-1 py-2 text-[11px] font-medium transition-colors focus-ring rounded-lg'
+  'flex flex-col items-center justify-center gap-1 flex-1 py-1.5 text-[11px] font-medium transition-colors focus-ring rounded-lg'
 
 export default function BottomNav() {
   // Warms each tab's route chunk the instant a finger touches down on it
@@ -19,7 +23,7 @@ export default function BottomNav() {
   const prefetchProfile = usePrefetchOnIntent(() => import('../pages/Profile.jsx'))
 
   return (
-    <nav className="app-shell fixed bottom-0 left-1/2 z-50 w-full max-w-[480px] -translate-x-1/2 border-t border-ink-100 bg-white/95 backdrop-blur px-1 pb-[max(env(safe-area-inset-bottom),6px)] pt-1">
+    <nav className="app-shell fixed bottom-0 left-1/2 z-50 w-full max-w-[480px] -translate-x-1/2 border-t border-ink-100 bg-white/95 backdrop-blur px-1 pb-[max(env(safe-area-inset-bottom),6px)] pt-0.5">
       <div className="flex items-center">
         <NavLink
           to="/home"

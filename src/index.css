@@ -7,9 +7,11 @@
     /* BottomNav.jsx's actual rendered height (icon + label + its own
        padding, safe-area aside) — kept as one shared number so anything
        that needs to sit clear of the floating bottom nav (Reels.jsx's
-       fixed full-screen layout) doesn't hardcode a second copy that can
-       drift out of sync if BottomNav's own padding ever changes. */
-    --bottom-nav-h: 64px;
+       fixed full-screen layout, PostDetail.jsx's comment composer)
+       doesn't hardcode a second copy that can drift out of sync if
+       BottomNav's own padding ever changes. Updated to 56px to match
+       BottomNav's slimmer vertical padding. */
+    --bottom-nav-h: 56px;
   }
 
   * {
