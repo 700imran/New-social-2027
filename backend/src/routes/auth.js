@@ -487,28 +487,22 @@ auth.post('/signup', async (c) => {
   // -------------------------------------------------------------------
 
   if (email && confirmationUrl) {
-  try {
-    const result = await sendConfirmationEmail(
-      c.env,
-      {
-        to: email,
-        displayName:
-          name.value || 'there',
-        confirmationUrl,
-      }
-    )
-
-    console.log(
-      'Signup: Resend accepted confirmation email',
-      result
-    )
-  } catch (e) {
+  sendConfirmationEmail(
+    c.env,
+    {
+      to: email,
+      displayName:
+        name.value || 'there',
+      confirmationUrl,
+    }
+  ).catch((e) => {
     console.error(
       'Signup: confirmation email failed',
-      e?.message || e
+      e
     )
-  }
+  })
 }
+
 
 
   //-----------------------------------------------------
