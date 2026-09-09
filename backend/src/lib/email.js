@@ -50,15 +50,11 @@ if (!env.EMAIL_FROM_ADDRESS) {
   if (!res.ok) {
   const detail = await res.text().catch(() => '')
 
-  console.error('[email] Resend API error', {
-    status: res.status,
-    detail,
-  })
-
   throw new Error(
     `Resend send failed (${res.status}): ${detail}`
   )
 }
+
 
 // ---------------------------------------------------------------------
 // HTML escaping
