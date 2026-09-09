@@ -21,17 +21,16 @@ const RESEND_ENDPOINT = 'https://api.resend.com/emails'
 
 async function sendViaResend(env, { to, subject, html }) {
   if (!env.RESEND_API_KEY) {
-  throw new Error(
-    'RESEND_API_KEY is not configured'
-  )
-}
+    throw new Error(
+      'RESEND_API_KEY is not configured'
+    )
+  }
 
-if (!env.EMAIL_FROM_ADDRESS) {
-  throw new Error(
-    'EMAIL_FROM_ADDRESS is not configured'
-  )
-}
-
+  if (!env.EMAIL_FROM_ADDRESS) {
+    throw new Error(
+      'EMAIL_FROM_ADDRESS is not configured'
+    )
+  }
 
   const res = await fetch(RESEND_ENDPOINT, {
     method: 'POST',
@@ -48,13 +47,15 @@ if (!env.EMAIL_FROM_ADDRESS) {
   })
 
   if (!res.ok) {
-  const detail = await res.text().catch(() => '')
+    const detail = await res.text().catch(() => '')
 
-  throw new Error(
-    `Resend send failed (${res.status}): ${detail}`
-  )
+    throw new Error(
+      `Resend send failed (${res.status}): ${detail}`
+    )
+  }
+
+  return res.json()
 }
-
 
 // ---------------------------------------------------------------------
 // HTML escaping
@@ -165,18 +166,15 @@ export async function sendConfirmationEmail(
 
 // ---------------------------------------------------------------------
 // Welcome email
-//
-// This remains available for other parts of your application.
-//
-// IMPORTANT:
-// If you send both confirmation + welcome during signup,
-// the user will receive TWO emails.
 // ---------------------------------------------------------------------
 
-export async function sendWelcomeEmail(env, {
-  to,
-  displayName,
-}) {
+export async function sendWelcomeEmail(
+  env,
+  {
+    to,
+    displayName,
+  }
+) {
   const name = escapeHtml(displayName || 'there')
 
   return sendViaResend(env, {
