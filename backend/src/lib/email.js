@@ -21,20 +21,17 @@ const RESEND_ENDPOINT = 'https://api.resend.com/emails'
 
 async function sendViaResend(env, { to, subject, html }) {
   if (!env.RESEND_API_KEY) {
-    console.warn(
-      '[email] RESEND_API_KEY not set — skipping send (see docs/EMAIL_SETUP.md)'
-    )
+  throw new Error(
+    'RESEND_API_KEY is not configured'
+  )
+}
 
-    return { skipped: true }
-  }
+if (!env.EMAIL_FROM_ADDRESS) {
+  throw new Error(
+    'EMAIL_FROM_ADDRESS is not configured'
+  )
+}
 
-  if (!env.EMAIL_FROM_ADDRESS) {
-    console.warn(
-      '[email] EMAIL_FROM_ADDRESS not set — skipping send (see docs/EMAIL_SETUP.md)'
-    )
-
-    return { skipped: true }
-  }
 
   const res = await fetch(RESEND_ENDPOINT, {
     method: 'POST',
