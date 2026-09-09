@@ -487,23 +487,33 @@ auth.post('/signup', async (c) => {
   // -------------------------------------------------------------------
 
   if (email && confirmationUrl) {
-    sendConfirmationEmail(
-      c.env,
-      {
-        to: email,
-        displayName:
-          name.value || 'there',
-        confirmationUrl,
-      }
-    ).catch((e) => {
-      console.error(
-        'Signup: confirmation email failed',
-        e
-      )
+  try {
+    await sendConfirmationEmail(c.env, {
+      to: email,
+      displayName: name.value || 'there',
+      confirmationUrl,
     })
-  }
 
-  // -------------------------------------------------------------------
+    console.log(
+      'Signup: confirmation email sent successfully'
+    )
+  } catch (e) {
+    console.error(
+      'Signup: confirmation email failed',
+      e
+    )
+
+    return c.json(
+      {
+        error:
+          'Account created, but confirmation email could not be sent.',
+      },
+      500
+    )
+  }
+}
+
+  //-----------------------------------------------------
   // WELCOME EMAIL
   //
   // WARNING:
