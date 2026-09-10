@@ -14,6 +14,9 @@ import admin from './routes/admin.js'
 import translate from './routes/translate.js'
 import settings from './routes/settings.js'
 import messages from './routes/messages.js'
+import live from './routes/live.js'
+import insights from './routes/insights.js'
+import support from './routes/support.js'
 
 const app = new Hono()
 
@@ -107,6 +110,9 @@ app.route('/v1', admin)
 app.route('/v1', translate)
 app.route('/v1', settings)
 app.route('/v1', messages)
+app.route('/v1', live)
+app.route('/v1', insights)
+app.route('/v1', support)
 
 // 404 handler
 app.notFound((c) => c.json({ error: 'Not found' }, 404))

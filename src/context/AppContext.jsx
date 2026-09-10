@@ -73,6 +73,7 @@ const EMPTY_USER = {
   posts: 0,
   topics: [],
   avatarUrl: null,
+  accountType: 'user',
 }
 
 export function AppProvider({ children }) {
@@ -847,6 +848,45 @@ export function AppProvider({ children }) {
       }
     },
     [currentUser.id, pushToast]
+  )
+
+  // Settings -> Your Experience -> Topics & interests. Same persistence
+  // completeOnboarding uses (interests live on the profile row, not a
+  // separate settings table), just callable any time after onboarding
+  // rather than only once at signup.
+  const updateInterests = useCallback(
+    (topics) => {
+      const previous = currentUser.topics
+      setSelectedTopics(topics)
+      setCurrentUser((u) => ({ ...u, topics }))
+      if (!isLive) return
+      api.updateProfile(currentUser.id, { interests: topics }).catch(() => {
+        setSelectedTopics(previous)
+        setCurrentUser((u) => ({ ...u, topics: previous }))
+        pushToast('Could not save your interests — please try again.')
+      })
+    },
+    [currentUser.id, currentUser.topics, pushToast]
+  )
+
+
+  // other settings write in this file: flips currentUser.accountType
+  // immediately (Settings/AccountType.jsx reflect it right away), then
+  // reconciles with the server and reverts + toasts on failure. Mock
+  // mode has no roles table to persist against, so it just keeps the
+  // optimistic value, same as every other mock-mode setting here.
+  const updateAccountType = useCallback(
+    (accountType) => {
+      const previous = currentUser.accountType
+      if (previous === accountType) return
+      setCurrentUser((u) => ({ ...u, accountType }))
+      if (!isLive) return
+      api.updateAccountType(accountType).catch(() => {
+        setCurrentUser((u) => ({ ...u, accountType: previous }))
+        pushToast('Could not update your account type — please try again.')
+      })
+    },
+    [currentUser.accountType, pushToast]
   )
 
   // ---------------------------------------------------------------------
@@ -1626,6 +1666,8 @@ export function AppProvider({ children }) {
     deleteAccount,
     submitReport,
     completeOnboarding,
+    updateInterests,
+    updateAccountType,
     toggleLike,
     toggleSave,
     repost,

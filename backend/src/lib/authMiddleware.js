@@ -46,6 +46,25 @@ export async function optionalAuth(c, next) {
   await next()
 }
 
+// The four selectable account types (Personal/Creator/Brand/Community)
+// are rows in the existing roles/user_roles seam — see
+// docs/migrations/014_community_role.sql for why this reuses it instead
+// of adding a column. 'admin' is deliberately excluded: it's an
+// elevated permission granted separately (see requireRole above), not
+// something an account switches into via routes/account.js's
+// PATCH /account/type.
+const ACCOUNT_TYPE_ROLES = ['user', 'creator', 'brand', 'community']
+
+export async function getAccountType(supabase, userId) {
+  const { data, error } = await supabase
+    .from('user_roles')
+    .select('roles(name)')
+    .eq('user_id', userId)
+  if (error || !data) return 'user'
+  const names = data.map((r) => r.roles?.name).filter(Boolean)
+  return names.find((n) => ACCOUNT_TYPE_ROLES.includes(n)) || 'user'
+}
+
 export function requireRole(roleName) {
   return async (c, next) => {
     const userId = c.get('userId')

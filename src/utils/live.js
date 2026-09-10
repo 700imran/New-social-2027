@@ -91,6 +91,7 @@ export function mapProfileToUser(userId, profile) {
     posts: profile?.postCount ?? 0,
     topics: profile?.interests || [],
     avatarUrl: profile?.avatarUrl || null,
+    accountType: profile?.accountType || 'user',
   }
 }
 

@@ -1,9 +1,51 @@
 import { Hono } from 'hono'
-import { adminClient } from '../lib/supabase.js'
-import { requireAuth } from '../lib/authMiddleware.js'
+import { adminClient, userClient } from '../lib/supabase.js'
+import { requireAuth, getAccountType } from '../lib/authMiddleware.js'
 import { deleteR2Object } from '../lib/r2.js'
 
 const account = new Hono()
+
+const ACCOUNT_TYPES = ['user', 'creator', 'brand', 'community']
+
+// GET/PATCH /v1/account/type — the account-type switch in Settings ->
+// Money & Business -> Account type. Reuses the roles/user_roles seam
+// (docs/bharatspace_level1_schema.sql, docs/migrations/014_community_role.sql)
+// rather than a new column: switching type = the caller's non-admin
+// role row is swapped for the new one. 'admin' is never touched here —
+// it's a separately granted permission (see requireRole), not a type.
+account.get('/account/type', requireAuth, async (c) => {
+  const supabase = userClient(c.env, c.get('jwt'))
+  const accountType = await getAccountType(supabase, c.get('userId'))
+  return c.json({ accountType })
+})
+
+account.patch('/account/type', requireAuth, async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  if (!ACCOUNT_TYPES.includes(body.accountType)) {
+    return c.json({ error: `accountType must be one of: ${ACCOUNT_TYPES.join(', ')}` }, 400)
+  }
+  const userId = c.get('userId')
+  // Needs adminClient, not the caller's own RLS-scoped client:
+  // 014_community_role.sql only grants anon/authenticated SELECT on
+  // user_roles, deliberately — no insert/update/delete grant exists for
+  // them at all, so a crafted request can't use this same table to grant
+  // itself 'admin'. service_role (adminClient) is the only thing that
+  // can write here.
+  const supabase = adminClient(c.env)
+
+  const { data: role, error: roleErr } = await supabase.from('roles').select('id').eq('name', body.accountType).single()
+  if (roleErr || !role) return c.json({ error: 'Server misconfiguration: role not found' }, 500)
+
+  const { data: nonAdminRoles } = await supabase.from('roles').select('id').neq('name', 'admin')
+  const nonAdminIds = (nonAdminRoles || []).map((r) => r.id)
+  const { error: deleteErr } = await supabase.from('user_roles').delete().eq('user_id', userId).in('role_id', nonAdminIds)
+  if (deleteErr) return c.json({ error: 'Could not update account type — please try again.' }, 500)
+
+  const { error: insertErr } = await supabase.from('user_roles').insert({ user_id: userId, role_id: role.id })
+  if (insertErr) return c.json({ error: 'Could not update account type — please try again.' }, 500)
+
+  return c.json({ accountType: body.accountType })
+})
 
 // DELETE /v1/account
 //

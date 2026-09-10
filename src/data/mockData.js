@@ -66,6 +66,7 @@ export const USERS = {
     following: 892,
     posts: 1200,
     topics: ['India News', 'Tech', 'Climate', 'Education'],
+    accountType: 'user',
   },
   rohit: { id: 'rohit', name: 'Rohit Verma', handle: '@rohit.verma', verified: false, avatarColor: 'from-blue-400 to-blue-600', initials: 'RV' },
   ananya: { id: 'ananya', name: 'Ananya Singh', handle: '@ananya.singh', verified: false, avatarColor: 'from-pink-400 to-rose-600', initials: 'AS' },

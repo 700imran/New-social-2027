@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { userClient } from '../lib/supabase.js'
 import { dbError } from '../lib/errorHandler.js'
-import { requireAuth, optionalAuth } from '../lib/authMiddleware.js'
+import { requireAuth, optionalAuth, getAccountType } from '../lib/authMiddleware.js'
 import { requireText, LIMITS } from '../lib/security.js'
 
 const users = new Hono()
@@ -69,7 +69,7 @@ users.get('/profiles/:id', optionalAuth, async (c) => {
   const { data: profile, error } = await supabase.from('profiles').select('*').eq('user_id', userId).single()
   if (error) return dbError(c, error, 'Not found', 404)
 
-  const [userRes, avatarRes, followersRes, followingRes, postsRes] = await Promise.all([
+  const [userRes, avatarRes, followersRes, followingRes, postsRes, accountType] = await Promise.all([
     supabase.from('users').select('created_at').eq('id', userId).single(),
     profile.avatar_asset_id
       ? supabase.from('media_assets').select('storage_key').eq('id', profile.avatar_asset_id).single()
@@ -77,6 +77,7 @@ users.get('/profiles/:id', optionalAuth, async (c) => {
     supabase.from('follows').select('follower_id', { count: 'exact', head: true }).eq('followee_id', userId),
     supabase.from('follows').select('followee_id', { count: 'exact', head: true }).eq('follower_id', userId),
     supabase.from('posts').select('id', { count: 'exact', head: true }).eq('author_id', userId),
+    getAccountType(supabase, userId),
   ])
 
   return c.json({
@@ -86,6 +87,7 @@ users.get('/profiles/:id', optionalAuth, async (c) => {
     followerCount: followersRes.count || 0,
     followingCount: followingRes.count || 0,
     postCount: postsRes.count || 0,
+    accountType,
   })
 })
 

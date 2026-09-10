@@ -68,6 +68,7 @@ export const LIMITS = {
   interestsMax: 12,
   mutedWord: 40,
   mutedWordsMax: 50,
+  liveTitle: 80,
 }
 
 // Returns a trimmed string on success, or a Response-ready error object —

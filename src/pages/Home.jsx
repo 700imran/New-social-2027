@@ -1,11 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Radio, Loader2 } from 'lucide-react'
+import { Radio, Loader2, Plus } from 'lucide-react'
 import HomeTopNav from '../components/HomeTopNav.jsx'
 import PostCard from '../components/PostCard.jsx'
 import PullToRefresh from '../components/PullToRefresh.jsx'
 import { useApp } from '../context/AppContext.jsx'
 import { isLive } from '../api/client.js'
+import * as api from '../api/client.js'
+import { subscribeToLiveStreams } from '../api/realtime.js'
 import { FEED_TABS, HIGHLIGHTS } from '../data/mockData.js'
 
 // Frontend-only for now (see docs/PRODUCT_DIRECTION_UPDATE.md — Stories
@@ -26,8 +28,22 @@ const STORIES_PREVIEW = {
 export default function Home() {
   const { posts, fetchPostsLive, fetchMorePosts, hasMorePosts, loadingMorePosts, fetchConversationsLive } = useApp()
   const [activeTab, setActiveTab] = useState('For You')
+  const [liveStreams, setLiveStreams] = useState([])
   const sentinelRef = useRef(null)
   const navigate = useNavigate()
+
+  // The one card at the front of this rail that's real, not mock: who's
+  // currently live (docs/migrations/015_live_streams.sql). Loaded once,
+  // then kept current by Realtime instead of polling — see
+  // subscribeToLiveStreams in api/realtime.js.
+  const refreshLiveStreams = () => {
+    if (!isLive) return
+    api.getActiveLiveStreams().then((res) => setLiveStreams(res.streams || [])).catch(() => {})
+  }
+  useEffect(() => {
+    refreshLiveStreams()
+    return subscribeToLiveStreams(refreshLiveStreams)
+  }, [])
 
   // Deliberately not part of AppContext's auth bootstrap effect — Home is
   // the first authenticated screen almost every session actually lands
@@ -81,6 +97,32 @@ export default function Home() {
       </div>
 
       <div className="flex gap-3 overflow-x-auto no-scrollbar bg-white px-4 py-4">
+        <button
+          onClick={() => navigate('/live/go')}
+          className="relative flex h-28 w-24 shrink-0 flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-bharat-red/40 bg-bharat-red/5 text-bharat-red"
+        >
+          <span className="flex h-9 w-9 items-center justify-center rounded-full bg-bharat-red text-white">
+            <Plus className="h-5 w-5" />
+          </span>
+          <span className="text-xs font-bold">Go Live</span>
+        </button>
+
+        {liveStreams.map((s) => (
+          <button
+            key={s.id}
+            onClick={() => navigate(`/live/${s.id}`)}
+            className="relative flex h-28 w-24 shrink-0 flex-col justify-between rounded-xl bg-gradient-to-br from-navy-800 to-navy-950 p-2.5 text-left text-white shadow-card"
+          >
+            <span className="absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-full bg-bharat-red px-1.5 py-0.5 text-[8px] font-bold">
+              <Radio className="h-2 w-2" /> Live
+            </span>
+            <div className="mt-auto">
+              <p className="text-xs font-bold leading-tight">{s.hostName}</p>
+              <p className="mt-0.5 truncate text-[9.5px] leading-tight text-white/80">{s.title}</p>
+            </div>
+          </button>
+        ))}
+
         {HIGHLIGHTS.map((h) => (
           <button
             key={h.id}

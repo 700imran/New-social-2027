@@ -31,6 +31,15 @@ const FollowList = lazy(() => import('./pages/FollowList.jsx'))
 const Settings = lazy(() => import('./pages/Settings.jsx'))
 const ChangePassword = lazy(() => import('./pages/ChangePassword.jsx'))
 const AccountType = lazy(() => import('./pages/AccountType.jsx'))
+const TopicsSettings = lazy(() => import('./pages/TopicsSettings.jsx'))
+const LiveGo = lazy(() => import('./pages/LiveGo.jsx'))
+const LiveView = lazy(() => import('./pages/LiveView.jsx'))
+const Call = lazy(() => import('./pages/Call.jsx'))
+const InsightsOverview = lazy(() => import('./pages/InsightsOverview.jsx'))
+const InsightsContent = lazy(() => import('./pages/InsightsContent.jsx'))
+const InsightsAudience = lazy(() => import('./pages/InsightsAudience.jsx'))
+const InsightsDiscovery = lazy(() => import('./pages/InsightsDiscovery.jsx'))
+const HelpSupport = lazy(() => import('./pages/HelpSupport.jsx'))
 const ManagedAccounts = lazy(() => import('./pages/ManagedAccounts.jsx'))
 const AboutApp = lazy(() => import('./pages/AboutApp.jsx'))
 const NotificationSettings = lazy(() => import('./pages/NotificationSettings.jsx'))
@@ -155,6 +164,15 @@ export default function App() {
           <Route path="/settings" element={<Settings />} />
           <Route path="/settings/password" element={<ChangePassword />} />
           <Route path="/settings/account-type" element={<AccountType />} />
+          <Route path="/settings/topics" element={<TopicsSettings />} />
+          <Route path="/live/go" element={<LiveGo />} />
+          <Route path="/live/:id" element={<LiveView />} />
+          <Route path="/call/:conversationId/:mode" element={<Call />} />
+          <Route path="/settings/insights/overview" element={<InsightsOverview />} />
+          <Route path="/settings/insights/content" element={<InsightsContent />} />
+          <Route path="/settings/insights/audience" element={<InsightsAudience />} />
+          <Route path="/settings/insights/discovery" element={<InsightsDiscovery />} />
+          <Route path="/settings/help" element={<HelpSupport />} />
           <Route path="/settings/blocked" element={<ManagedAccounts type="blocked" />} />
           <Route path="/settings/muted" element={<ManagedAccounts type="muted" />} />
           <Route path="/settings/about" element={<AboutApp />} />

@@ -1,0 +1,2283 @@
+diff --git a/backend/src/index.js b/backend/src/index.js
+index 945a5f5..306a51f 100644
+--- a/backend/src/index.js
++++ b/backend/src/index.js
+@@ -14,6 +14,9 @@ import admin from './routes/admin.js'
+ import translate from './routes/translate.js'
+ import settings from './routes/settings.js'
+ import messages from './routes/messages.js'
++import live from './routes/live.js'
++import insights from './routes/insights.js'
++import support from './routes/support.js'
+ 
+ const app = new Hono()
+ 
+@@ -107,6 +110,9 @@ app.route('/v1', admin)
+ app.route('/v1', translate)
+ app.route('/v1', settings)
+ app.route('/v1', messages)
++app.route('/v1', live)
++app.route('/v1', insights)
++app.route('/v1', support)
+ 
+ // 404 handler
+ app.notFound((c) => c.json({ error: 'Not found' }, 404))
+diff --git a/backend/src/lib/authMiddleware.js b/backend/src/lib/authMiddleware.js
+index 2a2aa52..e0c768e 100644
+--- a/backend/src/lib/authMiddleware.js
++++ b/backend/src/lib/authMiddleware.js
+@@ -46,6 +46,25 @@ export async function optionalAuth(c, next) {
+   await next()
+ }
+ 
++// The four selectable account types (Personal/Creator/Brand/Community)
++// are rows in the existing roles/user_roles seam — see
++// docs/migrations/014_community_role.sql for why this reuses it instead
++// of adding a column. 'admin' is deliberately excluded: it's an
++// elevated permission granted separately (see requireRole above), not
++// something an account switches into via routes/account.js's
++// PATCH /account/type.
++const ACCOUNT_TYPE_ROLES = ['user', 'creator', 'brand', 'community']
++
++export async function getAccountType(supabase, userId) {
++  const { data, error } = await supabase
++    .from('user_roles')
++    .select('roles(name)')
++    .eq('user_id', userId)
++  if (error || !data) return 'user'
++  const names = data.map((r) => r.roles?.name).filter(Boolean)
++  return names.find((n) => ACCOUNT_TYPE_ROLES.includes(n)) || 'user'
++}
++
+ export function requireRole(roleName) {
+   return async (c, next) => {
+     const userId = c.get('userId')
+diff --git a/backend/src/lib/security.js b/backend/src/lib/security.js
+index 9bf43ae..ee83882 100644
+--- a/backend/src/lib/security.js
++++ b/backend/src/lib/security.js
+@@ -68,6 +68,7 @@ export const LIMITS = {
+   interestsMax: 12,
+   mutedWord: 40,
+   mutedWordsMax: 50,
++  liveTitle: 80,
+ }
+ 
+ // Returns a trimmed string on success, or a Response-ready error object —
+diff --git a/backend/src/routes/account.js b/backend/src/routes/account.js
+index f8e0cc4..88e3971 100644
+--- a/backend/src/routes/account.js
++++ b/backend/src/routes/account.js
+@@ -1,10 +1,52 @@
+ import { Hono } from 'hono'
+-import { adminClient } from '../lib/supabase.js'
+-import { requireAuth } from '../lib/authMiddleware.js'
++import { adminClient, userClient } from '../lib/supabase.js'
++import { requireAuth, getAccountType } from '../lib/authMiddleware.js'
+ import { deleteR2Object } from '../lib/r2.js'
+ 
+ const account = new Hono()
+ 
++const ACCOUNT_TYPES = ['user', 'creator', 'brand', 'community']
++
++// GET/PATCH /v1/account/type — the account-type switch in Settings ->
++// Money & Business -> Account type. Reuses the roles/user_roles seam
++// (docs/bharatspace_level1_schema.sql, docs/migrations/014_community_role.sql)
++// rather than a new column: switching type = the caller's non-admin
++// role row is swapped for the new one. 'admin' is never touched here —
++// it's a separately granted permission (see requireRole), not a type.
++account.get('/account/type', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const accountType = await getAccountType(supabase, c.get('userId'))
++  return c.json({ accountType })
++})
++
++account.patch('/account/type', requireAuth, async (c) => {
++  const body = await c.req.json().catch(() => ({}))
++  if (!ACCOUNT_TYPES.includes(body.accountType)) {
++    return c.json({ error: `accountType must be one of: ${ACCOUNT_TYPES.join(', ')}` }, 400)
++  }
++  const userId = c.get('userId')
++  // Needs adminClient, not the caller's own RLS-scoped client:
++  // 014_community_role.sql only grants anon/authenticated SELECT on
++  // user_roles, deliberately — no insert/update/delete grant exists for
++  // them at all, so a crafted request can't use this same table to grant
++  // itself 'admin'. service_role (adminClient) is the only thing that
++  // can write here.
++  const supabase = adminClient(c.env)
++
++  const { data: role, error: roleErr } = await supabase.from('roles').select('id').eq('name', body.accountType).single()
++  if (roleErr || !role) return c.json({ error: 'Server misconfiguration: role not found' }, 500)
++
++  const { data: nonAdminRoles } = await supabase.from('roles').select('id').neq('name', 'admin')
++  const nonAdminIds = (nonAdminRoles || []).map((r) => r.id)
++  const { error: deleteErr } = await supabase.from('user_roles').delete().eq('user_id', userId).in('role_id', nonAdminIds)
++  if (deleteErr) return c.json({ error: 'Could not update account type — please try again.' }, 500)
++
++  const { error: insertErr } = await supabase.from('user_roles').insert({ user_id: userId, role_id: role.id })
++  if (insertErr) return c.json({ error: 'Could not update account type — please try again.' }, 500)
++
++  return c.json({ accountType: body.accountType })
++})
++
+ // DELETE /v1/account
+ //
+ // Permanently deletes the caller's account and everything referencing it.
+diff --git a/backend/src/routes/insights.js b/backend/src/routes/insights.js
+new file mode 100644
+index 0000000..c8135a7
+--- /dev/null
++++ b/backend/src/routes/insights.js
+@@ -0,0 +1,151 @@
++import { Hono } from 'hono'
++import { userClient } from '../lib/supabase.js'
++import { dbError } from '../lib/errorHandler.js'
++import { requireAuth } from '../lib/authMiddleware.js'
++
++const insights = new Hono()
++
++const WEEK_MS = 7 * 24 * 60 * 60 * 1000
++
++async function myPostIds(supabase, userId) {
++  const { data } = await supabase.from('posts').select('id').eq('author_id', userId)
++  return (data || []).map((p) => p.id)
++}
++
++// GET /v1/insights/overview — Settings -> Your Insights -> Overview.
++// Every number here is a real aggregate over this account's own rows
++// (posts/reactions/comments/follows) computed at request time — nothing
++// is tracked or stored separately for this, so there is no separate
++// "insights" table to keep in sync.
++insights.get('/insights/overview', requireAuth, async (c) => {
++  const userId = c.get('userId')
++  const supabase = userClient(c.env, c.get('jwt'))
++  const postIds = await myPostIds(supabase, userId)
++  const weekAgo = new Date(Date.now() - WEEK_MS).toISOString()
++
++  const [followers, following, likes, comments, newFollowers] = await Promise.all([
++    supabase.from('follows').select('follower_id', { count: 'exact', head: true }).eq('followee_id', userId),
++    supabase.from('follows').select('followee_id', { count: 'exact', head: true }).eq('follower_id', userId),
++    postIds.length
++      ? supabase.from('reactions').select('post_id', { count: 'exact', head: true }).in('post_id', postIds)
++      : Promise.resolve({ count: 0 }),
++    postIds.length
++      ? supabase.from('comments').select('post_id', { count: 'exact', head: true }).in('post_id', postIds)
++      : Promise.resolve({ count: 0 }),
++    supabase
++      .from('follows')
++      .select('follower_id', { count: 'exact', head: true })
++      .eq('followee_id', userId)
++      .gte('created_at', weekAgo),
++  ])
++
++  return c.json({
++    postCount: postIds.length,
++    followerCount: followers.count || 0,
++    followingCount: following.count || 0,
++    totalLikes: likes.count || 0,
++    totalComments: comments.count || 0,
++    newFollowersThisWeek: newFollowers.count || 0,
++  })
++})
++
++// GET /v1/insights/content — per-post breakdown, most-engaged first.
++insights.get('/insights/content', requireAuth, async (c) => {
++  const userId = c.get('userId')
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { data: posts, error } = await supabase
++    .from('posts')
++    .select('id, body, created_at')
++    .eq('author_id', userId)
++    .order('created_at', { ascending: false })
++    .limit(30)
++  if (error) return dbError(c, error, 'Could not load content insights', 500)
++  if (!posts?.length) return c.json({ posts: [] })
++
++  const postIds = posts.map((p) => p.id)
++  const [{ data: reactions }, { data: comments }] = await Promise.all([
++    supabase.from('reactions').select('post_id').in('post_id', postIds),
++    supabase.from('comments').select('post_id').in('post_id', postIds),
++  ])
++  const likeCounts = {}
++  ;(reactions || []).forEach((r) => (likeCounts[r.post_id] = (likeCounts[r.post_id] || 0) + 1))
++  const commentCounts = {}
++  ;(comments || []).forEach((cm) => (commentCounts[cm.post_id] = (commentCounts[cm.post_id] || 0) + 1))
++
++  const enriched = posts
++    .map((p) => ({
++      id: p.id,
++      body: p.body,
++      createdAt: p.created_at,
++      likeCount: likeCounts[p.id] || 0,
++      commentCount: commentCounts[p.id] || 0,
++    }))
++    .sort((a, b) => b.likeCount + b.commentCount - (a.likeCount + a.commentCount))
++
++  return c.json({ posts: enriched })
++})
++
++// GET /v1/insights/audience — follower/following counts plus a real
++// weekly new-follower trend (follows.created_at, grouped in JS since
++// this is a handful of rows per account, not worth a DB-side date_trunc).
++insights.get('/insights/audience', requireAuth, async (c) => {
++  const userId = c.get('userId')
++  const supabase = userClient(c.env, c.get('jwt'))
++  const sixWeeksAgo = new Date(Date.now() - 6 * WEEK_MS).toISOString()
++
++  const [followers, following, { data: recentFollows }] = await Promise.all([
++    supabase.from('follows').select('follower_id', { count: 'exact', head: true }).eq('followee_id', userId),
++    supabase.from('follows').select('followee_id', { count: 'exact', head: true }).eq('follower_id', userId),
++    supabase.from('follows').select('created_at').eq('followee_id', userId).gte('created_at', sixWeeksAgo),
++  ])
++
++  const weeks = Array.from({ length: 6 }, (_, i) => {
++    const start = Date.now() - (6 - i) * WEEK_MS
++    return { weekStart: new Date(start).toISOString(), count: 0 }
++  })
++  ;(recentFollows || []).forEach((f) => {
++    const t = new Date(f.created_at).getTime()
++    const idx = weeks.findIndex((w, i) => t >= new Date(w.weekStart).getTime() && (i === weeks.length - 1 || t < new Date(weeks[i + 1].weekStart).getTime()))
++    if (idx >= 0) weeks[idx].count += 1
++  })
++
++  return c.json({
++    followerCount: followers.count || 0,
++    followingCount: following.count || 0,
++    weeklyNewFollowers: weeks,
++  })
++})
++
++// GET /v1/insights/discovery — "Recommendations insights": how much of
++// this account's engagement comes from people who don't already follow
++// them, computed from real reaction/comment authorship vs. the follows
++// table (no separate impression/view tracking exists, so this is the
++// honest signal available today — see docs/migrations for what would be
++// needed to add reach/impressions on top of this later).
++insights.get('/insights/discovery', requireAuth, async (c) => {
++  const userId = c.get('userId')
++  const supabase = userClient(c.env, c.get('jwt'))
++  const postIds = await myPostIds(supabase, userId)
++  if (!postIds.length) return c.json({ followerEngagement: 0, nonFollowerEngagement: 0 })
++
++  const [{ data: reactions }, { data: comments }] = await Promise.all([
++    supabase.from('reactions').select('user_id').in('post_id', postIds),
++    supabase.from('comments').select('author_id').in('post_id', postIds),
++  ])
++  const engagerIds = [...new Set([...(reactions || []).map((r) => r.user_id), ...(comments || []).map((cm) => cm.author_id)])]
++  if (!engagerIds.length) return c.json({ followerEngagement: 0, nonFollowerEngagement: 0 })
++
++  const { data: followerMatches } = await supabase
++    .from('follows')
++    .select('follower_id')
++    .eq('followee_id', userId)
++    .in('follower_id', engagerIds)
++  const followerEngagement = followerMatches?.length || 0
++
++  return c.json({
++    followerEngagement,
++    nonFollowerEngagement: engagerIds.length - followerEngagement,
++  })
++})
++
++export default insights
+diff --git a/backend/src/routes/live.js b/backend/src/routes/live.js
+new file mode 100644
+index 0000000..31547f2
+--- /dev/null
++++ b/backend/src/routes/live.js
+@@ -0,0 +1,96 @@
++import { Hono } from 'hono'
++import { userClient } from '../lib/supabase.js'
++import { dbError } from '../lib/errorHandler.js'
++import { requireAuth, optionalAuth } from '../lib/authMiddleware.js'
++import { requireText, LIMITS } from '../lib/security.js'
++
++const live = new Hono()
++
++// GET /v1/live/active — feeds the "Go Live" rail on Home.jsx. Public
++// (optionalAuth): whether someone is live is meant to be visible to a
++// logged-out visitor too, same as the rest of the rail.
++live.get('/live/active', optionalAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt') || c.env.SUPABASE_ANON_KEY)
++  const { data: streams, error } = await supabase
++    .from('live_streams')
++    .select('id, host_id, title, started_at')
++    .eq('status', 'live')
++    .order('started_at', { ascending: false })
++    .limit(20)
++  if (error) return dbError(c, error, 'Could not load live streams', 500)
++  if (!streams?.length) return c.json({ streams: [] })
++
++  const hostIds = [...new Set(streams.map((s) => s.host_id))]
++  const { data: profiles } = await supabase
++    .from('profiles')
++    .select('user_id, display_name, avatar_asset_id')
++    .in('user_id', hostIds)
++  const profileById = Object.fromEntries((profiles || []).map((p) => [p.user_id, p]))
++
++  const avatarIds = (profiles || []).map((p) => p.avatar_asset_id).filter(Boolean)
++  const { data: media } = avatarIds.length
++    ? await supabase.from('media_assets').select('id, storage_key').in('id', avatarIds)
++    : { data: [] }
++  const mediaById = Object.fromEntries((media || []).map((m) => [m.id, m]))
++
++  return c.json({
++    streams: streams.map((s) => {
++      const profile = profileById[s.host_id]
++      const storageKey = profile?.avatar_asset_id ? mediaById[profile.avatar_asset_id]?.storage_key : null
++      return {
++        id: s.id,
++        hostId: s.host_id,
++        hostName: profile?.display_name || 'BharatSpace user',
++        hostAvatarUrl: storageKey ? `${c.env.R2_PUBLIC_BASE_URL}/${storageKey}` : null,
++        title: s.title,
++        startedAt: s.started_at,
++      }
++    }),
++  })
++})
++
++// POST /v1/live/start — ends any of the caller's own still-'live' rows
++// first (a crashed tab/app that never called .../end shouldn't let one
++// account show up twice in the rail), then opens the new one.
++live.post('/live/start', requireAuth, async (c) => {
++  const body = await c.req.json().catch(() => ({}))
++  const v = requireText(body.title, { field: 'title', max: LIMITS.liveTitle })
++  if (v.error) return c.json({ error: v.error }, 400)
++
++  const userId = c.get('userId')
++  const supabase = userClient(c.env, c.get('jwt'))
++
++  await supabase
++    .from('live_streams')
++    .update({ status: 'ended', ended_at: new Date().toISOString() })
++    .eq('host_id', userId)
++    .eq('status', 'live')
++
++  const { data, error } = await supabase
++    .from('live_streams')
++    .insert({ host_id: userId, title: v.value })
++    .select('id, title, started_at')
++    .single()
++  if (error) return dbError(c, error, 'Could not start your stream', 500)
++
++  return c.json({ id: data.id, title: data.title, startedAt: data.started_at })
++})
++
++// PATCH /v1/live/:id/end — RLS (015_live_streams.sql) already restricts
++// this to the row's own host_id, so a mismatched id 404s at the DB layer
++// (no matching row to update) rather than needing a manual ownership
++// check here first.
++live.patch('/live/:id/end', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { data, error } = await supabase
++    .from('live_streams')
++    .update({ status: 'ended', ended_at: new Date().toISOString() })
++    .eq('id', c.req.param('id'))
++    .eq('host_id', c.get('userId'))
++    .select('id')
++    .single()
++  if (error || !data) return c.json({ error: 'Stream not found' }, 404)
++  return c.json({ ok: true })
++})
++
++export default live
+diff --git a/backend/src/routes/support.js b/backend/src/routes/support.js
+new file mode 100644
+index 0000000..d2370da
+--- /dev/null
++++ b/backend/src/routes/support.js
+@@ -0,0 +1,48 @@
++import { Hono } from 'hono'
++import { userClient } from '../lib/supabase.js'
++import { dbError } from '../lib/errorHandler.js'
++import { requireAuth } from '../lib/authMiddleware.js'
++import { checkRateLimit, requireText } from '../lib/security.js'
++
++const support = new Hono()
++
++// GET /v1/support/tickets — Settings -> Tools & Support -> Help &
++// support. RLS (016_support_tickets.sql) already restricts this to the
++// caller's own tickets.
++support.get('/support/tickets', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { data, error } = await supabase
++    .from('support_tickets')
++    .select('id, subject, body, status, created_at')
++    .order('created_at', { ascending: false })
++  if (error) return dbError(c, error, 'Could not load your support tickets', 500)
++  return c.json({ tickets: data || [] })
++})
++
++// POST /v1/support/tickets  { subject, body }
++//
++// Same shape as POST /v1/reports: no admin UI reviews these yet —
++// Supabase's own Table Editor is how a ticket gets read and resolved
++// today (see docs/migrations/016_support_tickets.sql's comment).
++support.post('/support/tickets', requireAuth, async (c) => {
++  const rate = await checkRateLimit(c.env, 'WRITE_RATE_LIMITER', c.get('userId'))
++  if (!rate.allowed) return c.json({ error: 'Please slow down.' }, 429)
++
++  const body = await c.req.json().catch(() => ({}))
++  const subject = requireText(body.subject, { field: 'subject', max: 120 })
++  if (subject.error) return c.json({ error: subject.error }, 400)
++  const message = requireText(body.body, { field: 'message', max: 2000 })
++  if (message.error) return c.json({ error: message.error }, 400)
++
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { data, error } = await supabase
++    .from('support_tickets')
++    .insert({ user_id: c.get('userId'), subject: subject.value, body: message.value })
++    .select('id, subject, body, status, created_at')
++    .single()
++  if (error) return dbError(c, error, 'Could not submit your request', 500)
++
++  return c.json(data, 201)
++})
++
++export default support
+diff --git a/backend/src/routes/users.js b/backend/src/routes/users.js
+index 98baa21..fd5589f 100644
+--- a/backend/src/routes/users.js
++++ b/backend/src/routes/users.js
+@@ -1,7 +1,7 @@
+ import { Hono } from 'hono'
+ import { userClient } from '../lib/supabase.js'
+ import { dbError } from '../lib/errorHandler.js'
+-import { requireAuth, optionalAuth } from '../lib/authMiddleware.js'
++import { requireAuth, optionalAuth, getAccountType } from '../lib/authMiddleware.js'
+ import { requireText, LIMITS } from '../lib/security.js'
+ 
+ const users = new Hono()
+@@ -69,7 +69,7 @@ users.get('/profiles/:id', optionalAuth, async (c) => {
+   const { data: profile, error } = await supabase.from('profiles').select('*').eq('user_id', userId).single()
+   if (error) return dbError(c, error, 'Not found', 404)
+ 
+-  const [userRes, avatarRes, followersRes, followingRes, postsRes] = await Promise.all([
++  const [userRes, avatarRes, followersRes, followingRes, postsRes, accountType] = await Promise.all([
+     supabase.from('users').select('created_at').eq('id', userId).single(),
+     profile.avatar_asset_id
+       ? supabase.from('media_assets').select('storage_key').eq('id', profile.avatar_asset_id).single()
+@@ -77,6 +77,7 @@ users.get('/profiles/:id', optionalAuth, async (c) => {
+     supabase.from('follows').select('follower_id', { count: 'exact', head: true }).eq('followee_id', userId),
+     supabase.from('follows').select('followee_id', { count: 'exact', head: true }).eq('follower_id', userId),
+     supabase.from('posts').select('id', { count: 'exact', head: true }).eq('author_id', userId),
++    getAccountType(supabase, userId),
+   ])
+ 
+   return c.json({
+@@ -86,6 +87,7 @@ users.get('/profiles/:id', optionalAuth, async (c) => {
+     followerCount: followersRes.count || 0,
+     followingCount: followingRes.count || 0,
+     postCount: postsRes.count || 0,
++    accountType,
+   })
+ })
+ 
+diff --git a/docs/migrations/013_enable_realtime.sql b/docs/migrations/013_enable_realtime.sql
+new file mode 100644
+index 0000000..725e11e
+--- /dev/null
++++ b/docs/migrations/013_enable_realtime.sql
+@@ -0,0 +1,11 @@
++-- Migration 013: turns on Realtime for the two tables src/api/realtime.js
++-- subscribes to. RLS alone (already correct on both — see 011_user_settings.sql
++-- and 012_direct_messages.sql) scopes who can see what; it does NOT make a
++-- table emit change events over the Realtime websocket. That's a separate
++-- opt-in: a table has to be added to the `supabase_realtime` publication,
++-- which this migration does directly via SQL (equivalent to toggling
++-- Database -> Replication -> supabase_realtime for these two tables in the
++-- dashboard, which works exactly as well — this is just the reproducible,
++-- reviewable version of the same one-time step).
++alter publication supabase_realtime add table public.messages;
++alter publication supabase_realtime add table public.user_settings;
+diff --git a/docs/migrations/014_community_role.sql b/docs/migrations/014_community_role.sql
+new file mode 100644
+index 0000000..a06f7be
+--- /dev/null
++++ b/docs/migrations/014_community_role.sql
+@@ -0,0 +1,23 @@
++-- Account types (Personal/Creator/Brand/Community) reuse the roles /
++-- user_roles seam docs/bharatspace_level1_schema.sql already built for
++-- this ("Scale seam... ABAC-style multi-role logic can be added later
++-- without a schema migration") — 'user','creator','brand','admin' are
++-- already there from day one; this adds the one missing option.
++insert into roles (name)
++select 'community'
++where not exists (select 1 from roles where name = 'community');
++
++-- roles/user_roles were created in the base schema with no RLS and no
++-- grant to anon/authenticated at all (verified by grep against every
++-- migration — everything else in this schema follows an explicit
++-- default-deny-then-grant pattern, e.g. 006's `grant select on
++-- public.notifications to authenticated`, and these two tables were
++-- simply never given one). Read-only, no per-row RLS needed: same
++-- treatment as `grant select (id, created_at) on public.users` in
++-- 010_blocks_users_auditlog_rls.sql — a role name is meant to be
++-- visible on the profile that has it (a "Creator"/"Brand" badge is
++-- public by nature), not a secret. Write access stays service_role-only
++-- (backend/src/routes/account.js's PATCH /account/type uses
++-- adminClient specifically so a crafted request can't grant itself
++-- 'admin' through this same table).
++grant select on public.roles, public.user_roles to anon, authenticated;
+diff --git a/docs/migrations/015_live_streams.sql b/docs/migrations/015_live_streams.sql
+new file mode 100644
+index 0000000..f54d651
+--- /dev/null
++++ b/docs/migrations/015_live_streams.sql
+@@ -0,0 +1,51 @@
++-- Migration 015: live_streams — backs the "Go Live" entry point at the
++-- front of Home's Stories rail (previously a fully static mock card with
++-- a fake "Live" badge, per docs/PRODUCT_DIRECTION_UPDATE.md's note that
++-- Stories itself is frontend-only; this is deliberately a separate,
++-- real table rather than folding into that placeholder).
++--
++-- Scope, stated plainly: this table is the *session lifecycle* only —
++-- who's live, since when, what they titled it. Viewer count and chat use
++-- Supabase Realtime's Presence/Broadcast channels instead of tables here
++-- (ephemeral by nature, no row-per-viewer or row-per-message write load).
++-- Actual video transport (capturing and delivering the stream itself)
++-- needs a WebRTC signaling/media-server decision this migration doesn't
++-- make — see src/pages/Live.jsx's own comment for exactly what that
++-- gap is and what it would take to close it.
++create table if not exists live_streams (
++  id uuid primary key default gen_random_uuid(),
++  host_id uuid not null references users(id) on delete cascade,
++  title text not null,
++  status text not null default 'live' check (status in ('live', 'ended')),
++  started_at timestamptz not null default now(),
++  ended_at timestamptz
++);
++
++create index if not exists live_streams_status_idx on live_streams (status, started_at desc);
++
++alter table live_streams enable row level security;
++
++-- Publicly readable, same reasoning as profiles/posts: whether someone
++-- is currently live is meant to be visible, including to logged-out
++-- visitors browsing the Home rail.
++drop policy if exists "live streams are publicly readable" on live_streams;
++create policy "live streams are publicly readable"
++  on live_streams for select using (true);
++
++drop policy if exists "hosts start their own stream" on live_streams;
++create policy "hosts start their own stream"
++  on live_streams for insert with check (auth.uid() = host_id);
++
++-- Update is host-only and is only ever used to end the caller's own
++-- stream (status -> 'ended', ended_at set) — see PATCH /v1/live/:id/end.
++drop policy if exists "hosts end their own stream" on live_streams;
++create policy "hosts end their own stream"
++  on live_streams for update using (auth.uid() = host_id) with check (auth.uid() = host_id);
++
++grant select on public.live_streams to anon, authenticated;
++grant insert, update on public.live_streams to authenticated;
++
++-- So Home.jsx's rail can update the instant someone goes live/ends,
++-- not just on its next poll. Added here (015), not 013_enable_realtime.sql,
++-- because this table doesn't exist yet when 013 runs.
++alter publication supabase_realtime add table public.live_streams;
+diff --git a/docs/migrations/016_support_tickets.sql b/docs/migrations/016_support_tickets.sql
+new file mode 100644
+index 0000000..70b4071
+--- /dev/null
++++ b/docs/migrations/016_support_tickets.sql
+@@ -0,0 +1,46 @@
++-- Migration 016: Settings -> Tools & Support -> Help & support. Same
++-- pattern as 002_reports.sql exactly: create-and-read-your-own from the
++-- app, admin review via Supabase's Table Editor (no admin UI built for
++-- either one yet — see 002_reports.sql's own comment on that tradeoff).
++create table if not exists support_tickets (
++  id uuid primary key default gen_random_uuid(),
++  user_id uuid not null references users(id) on delete cascade,
++  subject text not null,
++  body text not null,
++  status text not null default 'open' check (status in ('open', 'resolved')),
++  created_at timestamptz not null default now()
++);
++
++create index if not exists support_tickets_status_idx on support_tickets(status);
++
++alter table support_tickets enable row level security;
++
++drop policy if exists "users create their own tickets" on support_tickets;
++create policy "users create their own tickets"
++  on support_tickets for insert with check (auth.uid() = user_id);
++
++drop policy if exists "users read their own tickets" on support_tickets;
++create policy "users read their own tickets"
++  on support_tickets for select using (auth.uid() = user_id);
++
++drop policy if exists "admins read all tickets" on support_tickets;
++create policy "admins read all tickets"
++  on support_tickets for select using (
++    exists (
++      select 1 from user_roles ur
++      join roles r on r.id = ur.role_id
++      where ur.user_id = auth.uid() and r.name = 'admin'
++    )
++  );
++
++drop policy if exists "admins update ticket status" on support_tickets;
++create policy "admins update ticket status"
++  on support_tickets for update using (
++    exists (
++      select 1 from user_roles ur
++      join roles r on r.id = ur.role_id
++      where ur.user_id = auth.uid() and r.name = 'admin'
++    )
++  );
++
++grant select, insert, update on public.support_tickets to authenticated;
+diff --git a/index.html b/index.html
+index 3e587a5..3044422 100644
+--- a/index.html
++++ b/index.html
+@@ -2,7 +2,7 @@
+ <html lang="en">
+   <head>
+     <meta charset="UTF-8" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, interactive-widget=resizes-content" />
+     <title>BharatSpace — People · Ideas · India</title>
+     <meta name="description" content="BharatSpace — India's real-time social network." />
+     <link rel="preconnect" href="https://fonts.googleapis.com" />
+diff --git a/package-lock.json b/package-lock.json
+index a83ca45..7df699b 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,6 +8,7 @@
+       "name": "bharatspace",
+       "version": "1.0.0",
+       "dependencies": {
++        "@supabase/supabase-js": "^2.116.0",
+         "lucide-react": "^0.383.0",
+         "react": "^18.2.0",
+         "react-dom": "^18.2.0",
+@@ -1220,6 +1221,98 @@
+         "win32"
+       ]
+     },
++    "node_modules/@supabase/auth-js": {
++      "version": "2.116.0",
++      "resolved": "https://registry.npmjs.org/@supabase/auth-js/-/auth-js-2.116.0.tgz",
++      "integrity": "sha512-Cmosty12gyKGK9N3bQb+lMmuAFev5nmUzaR1AsmZHqKOAGzqX1VQzmp49CNPwOx/pw0H9Qqk4rs9yhwTlKpfDg==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/functions-js": {
++      "version": "2.116.0",
++      "resolved": "https://registry.npmjs.org/@supabase/functions-js/-/functions-js-2.116.0.tgz",
++      "integrity": "sha512-E+VOc2QDcni/fySqkBFiZhnoB3SGydEdZgFI6/dEAGAHx6yEhB46TN9qb2wXs+E+RSzOBV0R6dasiSlw4xlZAA==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/phoenix": {
++      "version": "0.4.5",
++      "resolved": "https://registry.npmjs.org/@supabase/phoenix/-/phoenix-0.4.5.tgz",
++      "integrity": "sha512-aAn9H9ovVyeApKy11OWOrrOGq8DV68yWeH4ud2lN9fzn4aO8Zb5GLL9m1pUg9nLqIcT+ZDfAcsZe0E/nqdv2lw==",
++      "license": "MIT"
++    },
++    "node_modules/@supabase/postgrest-js": {
++      "version": "2.116.0",
++      "resolved": "https://registry.npmjs.org/@supabase/postgrest-js/-/postgrest-js-2.116.0.tgz",
++      "integrity": "sha512-kGpVZTDHxFTJS3tu+rU0iTAZ+4U0bcLVjxwCk8f3gRhjw3qdCZjTBlgYvc4kGH2XccmAzbkKwXL/mrNHMGSc+A==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/realtime-js": {
++      "version": "2.116.0",
++      "resolved": "https://registry.npmjs.org/@supabase/realtime-js/-/realtime-js-2.116.0.tgz",
++      "integrity": "sha512-MHAnlXxi2s6yiJsZsQMfs2B3RFxeVfQWxerqYhIMqcCQV/FuY3LIeouPEkXw/ah7wUWMLYwempF9MOCUScyddg==",
++      "license": "MIT",
++      "dependencies": {
++        "@supabase/phoenix": "0.4.5",
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/storage-js": {
++      "version": "2.116.0",
++      "resolved": "https://registry.npmjs.org/@supabase/storage-js/-/storage-js-2.116.0.tgz",
++      "integrity": "sha512-6/3hR6vccBP6oGM5B6RfbwZcTCKmQOodd/ZWQdsw8yJsU5zO/a//oBL6yLnmgxcjnHSrelW8rsO7hL5DPybyUQ==",
++      "license": "MIT",
++      "dependencies": {
++        "iceberg-js": "^0.8.1",
++        "tslib": "2.8.1"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      }
++    },
++    "node_modules/@supabase/supabase-js": {
++      "version": "2.116.0",
++      "resolved": "https://registry.npmjs.org/@supabase/supabase-js/-/supabase-js-2.116.0.tgz",
++      "integrity": "sha512-YyWmKXt2NspV9iO8FPnlswUFJIRnrLd3oTCb+3ZyYRuKZtBH0xCUDgnUqoyA0fGUxpM/UhfwDjYf/dht/9bp7g==",
++      "license": "MIT",
++      "dependencies": {
++        "@supabase/auth-js": "2.116.0",
++        "@supabase/functions-js": "2.116.0",
++        "@supabase/postgrest-js": "2.116.0",
++        "@supabase/realtime-js": "2.116.0",
++        "@supabase/storage-js": "2.116.0"
++      },
++      "engines": {
++        "node": ">=22.0.0"
++      },
++      "peerDependencies": {
++        "@opentelemetry/api": ">=1.0.0"
++      },
++      "peerDependenciesMeta": {
++        "@opentelemetry/api": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/@types/babel__core": {
+       "version": "7.20.5",
+       "resolved": "https://registry.npmjs.org/@types/babel__core/-/babel__core-7.20.5.tgz",
+@@ -1772,6 +1865,15 @@
+         "node": ">= 0.4"
+       }
+     },
++    "node_modules/iceberg-js": {
++      "version": "0.8.1",
++      "resolved": "https://registry.npmjs.org/iceberg-js/-/iceberg-js-0.8.1.tgz",
++      "integrity": "sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=20.0.0"
++      }
++    },
+     "node_modules/is-binary-path": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/is-binary-path/-/is-binary-path-2.1.0.tgz",
+@@ -2646,6 +2748,12 @@
+       "dev": true,
+       "license": "Apache-2.0"
+     },
++    "node_modules/tslib": {
++      "version": "2.8.1",
++      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
++      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
++      "license": "0BSD"
++    },
+     "node_modules/update-browserslist-db": {
+       "version": "1.3.2",
+       "resolved": "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.3.2.tgz",
+diff --git a/package.json b/package.json
+index 4464cd2..3822d5a 100644
+--- a/package.json
++++ b/package.json
+@@ -9,6 +9,7 @@
+     "preview": "vite preview"
+   },
+   "dependencies": {
++    "@supabase/supabase-js": "^2.116.0",
+     "lucide-react": "^0.383.0",
+     "react": "^18.2.0",
+     "react-dom": "^18.2.0",
+diff --git a/src/App.jsx b/src/App.jsx
+index d4ec97c..39add0a 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -31,6 +31,15 @@ const FollowList = lazy(() => import('./pages/FollowList.jsx'))
+ const Settings = lazy(() => import('./pages/Settings.jsx'))
+ const ChangePassword = lazy(() => import('./pages/ChangePassword.jsx'))
+ const AccountType = lazy(() => import('./pages/AccountType.jsx'))
++const TopicsSettings = lazy(() => import('./pages/TopicsSettings.jsx'))
++const LiveGo = lazy(() => import('./pages/LiveGo.jsx'))
++const LiveView = lazy(() => import('./pages/LiveView.jsx'))
++const Call = lazy(() => import('./pages/Call.jsx'))
++const InsightsOverview = lazy(() => import('./pages/InsightsOverview.jsx'))
++const InsightsContent = lazy(() => import('./pages/InsightsContent.jsx'))
++const InsightsAudience = lazy(() => import('./pages/InsightsAudience.jsx'))
++const InsightsDiscovery = lazy(() => import('./pages/InsightsDiscovery.jsx'))
++const HelpSupport = lazy(() => import('./pages/HelpSupport.jsx'))
+ const ManagedAccounts = lazy(() => import('./pages/ManagedAccounts.jsx'))
+ const AboutApp = lazy(() => import('./pages/AboutApp.jsx'))
+ const NotificationSettings = lazy(() => import('./pages/NotificationSettings.jsx'))
+@@ -155,6 +164,15 @@ export default function App() {
+           <Route path="/settings" element={<Settings />} />
+           <Route path="/settings/password" element={<ChangePassword />} />
+           <Route path="/settings/account-type" element={<AccountType />} />
++          <Route path="/settings/topics" element={<TopicsSettings />} />
++          <Route path="/live/go" element={<LiveGo />} />
++          <Route path="/live/:id" element={<LiveView />} />
++          <Route path="/call/:conversationId/:mode" element={<Call />} />
++          <Route path="/settings/insights/overview" element={<InsightsOverview />} />
++          <Route path="/settings/insights/content" element={<InsightsContent />} />
++          <Route path="/settings/insights/audience" element={<InsightsAudience />} />
++          <Route path="/settings/insights/discovery" element={<InsightsDiscovery />} />
++          <Route path="/settings/help" element={<HelpSupport />} />
+           <Route path="/settings/blocked" element={<ManagedAccounts type="blocked" />} />
+           <Route path="/settings/muted" element={<ManagedAccounts type="muted" />} />
+           <Route path="/settings/about" element={<AboutApp />} />
+diff --git a/src/api/client.js b/src/api/client.js
+index 0d12f3c..24da670 100644
+--- a/src/api/client.js
++++ b/src/api/client.js
+@@ -16,6 +16,8 @@
+ const BASE_URL = import.meta.env.VITE_API_BASE_URL || null
+ export const isLive = Boolean(BASE_URL)
+ 
++import { setRealtimeAuth } from './realtime.js'
++
+ // Access token only — kept in memory (a module-level variable), never in
+ // localStorage/sessionStorage. The refresh token never touches JS at all;
+ // it lives in an httpOnly cookie the backend sets (see routes/auth.js),
+@@ -25,6 +27,10 @@ export const isLive = Boolean(BASE_URL)
+ let accessToken = null
+ export function setAccessToken(token) {
+   accessToken = token
++  // Keeps the optional Realtime layer's socket auth current too — see
++  // api/realtime.js. A no-op there when VITE_SUPABASE_URL/ANON_KEY
++  // aren't set, so this is safe to call unconditionally.
++  setRealtimeAuth(token)
+ }
+ 
+ // Thrown only when fetch() itself fails to reach the server at all (no
+@@ -157,6 +163,16 @@ export async function updatePasswordWithToken(oneOffToken, password) {
+ 
+ export const getProfile = (userId) => request(`/profiles/${userId}`, { auth: false })
+ export const updateProfile = (userId, updates) => request(`/profiles/${userId}`, { method: 'PATCH', body: updates })
++export const updateAccountType = (accountType) => request('/account/type', { method: 'PATCH', body: { accountType } })
++export const getActiveLiveStreams = () => request('/live/active', { auth: false })
++export const startLiveStream = (title) => request('/live/start', { method: 'POST', body: { title } })
++export const endLiveStream = (id) => request(`/live/${id}/end`, { method: 'PATCH' })
++export const getInsightsOverview = () => request('/insights/overview')
++export const getInsightsContent = () => request('/insights/content')
++export const getInsightsAudience = () => request('/insights/audience')
++export const getInsightsDiscovery = () => request('/insights/discovery')
++export const getSupportTickets = () => request('/support/tickets')
++export const createSupportTicket = (subject, body) => request('/support/tickets', { method: 'POST', body: { subject, body } })
+ export const follow = (followeeId) => request('/follows', { method: 'POST', body: { followeeId } })
+ export const unfollow = (followeeId) => request(`/follows/${followeeId}`, { method: 'DELETE' })
+ export const getFollowers = (userId) => request(`/users/${userId}/followers`, { auth: false })
+diff --git a/src/api/realtime.js b/src/api/realtime.js
+new file mode 100644
+index 0000000..bb9e9be
+--- /dev/null
++++ b/src/api/realtime.js
+@@ -0,0 +1,144 @@
++// api/realtime.js — an optional *listening* layer alongside the existing
++// REST seam in api/client.js. Every read and write still goes through the
++// Worker exactly as before; this only subscribes to Postgres changes over
++// websocket via supabase-js's Realtime client, for the two cases that
++// genuinely need a push instead of a poll: a message arriving in an open
++// conversation from the other participant, and this account's settings
++// changing from a *different* signed-in session/device.
++//
++// Needs two more env vars beyond VITE_API_BASE_URL: VITE_SUPABASE_URL and
++// VITE_SUPABASE_ANON_KEY (the public anon key — safe to expose client-side,
++// same as any Supabase frontend; RLS is what actually scopes every
++// subscription below, not secrecy of this key). Get both from your
++// Supabase project's dashboard -> Settings -> API. Leave either unset and
++// every export here becomes a no-op — same "isLive" fallback shape
++// api/client.js already uses for VITE_API_BASE_URL, so a deployment that
++// hasn't set these up yet just keeps working exactly as it does today
++// (fetch-on-open, no push) instead of breaking.
++//
++// Before this can actually receive anything, two tables need Realtime
++// turned on in your Supabase project — see
++// docs/migrations/013_enable_realtime.sql for the one-time SQL (or the
++// dashboard -> Database -> Replication toggle, same effect). Their RLS
++// policies (migrations 011 and 012) already scope who can see what; this
++// file doesn't add or need any new policy.
++import { createClient } from '@supabase/supabase-js'
++
++const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || null
++const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || null
++export const isRealtimeConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY)
++
++const client = isRealtimeConfigured
++  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
++      auth: { persistSession: false, autoRefreshToken: false },
++    })
++  : null
++
++// Called from api/client.js's setAccessToken so every place that already
++// keeps the REST access token current (sign-in, the once-per-load
++// refresh, sign-out) keeps Realtime's auth current too, with no second
++// call site to remember. Falls back to the anon key (read: "no user,
++// anonymous-only RLS access") on sign-out rather than leaving a stale
++// token attached to the socket.
++export function setRealtimeAuth(token) {
++  if (!client) return
++  client.realtime.setAuth(token || SUPABASE_ANON_KEY)
++}
++
++// Home.jsx's "Go Live" rail: re-fetches the active-streams list the
++// instant one starts or ends anywhere, instead of only on next mount/poll.
++export function subscribeToLiveStreams(onChange) {
++  if (!client) return () => {}
++  const channel = client
++    .channel('live_streams:all')
++    .on('postgres_changes', { event: '*', schema: 'public', table: 'live_streams' }, onChange)
++    .subscribe()
++  return () => client.removeChannel(channel)
++}
++
++// Subscribes to new messages landing in one open conversation. Only
++// fires for the *other* participant's sends — this tab's own messages
++// are already added optimistically by sendMessage() in AppContext.jsx,
++// and AppContext's receiveRealtimeMessage dedupes by id regardless, so a
++// redundant delivery (e.g. a brief reconnect) is harmless either way.
++// Returns an unsubscribe function; safe to call even when Realtime isn't
++// configured, since it just returns a no-op.
++export function subscribeToMessages(conversationId, onInsert) {
++  if (!client || !conversationId) return () => {}
++  const channel = client
++    .channel(`messages:${conversationId}`)
++    .on(
++      'postgres_changes',
++      { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversationId}` },
++      (payload) => onInsert(payload.new)
++    )
++    .subscribe()
++  return () => client.removeChannel(channel)
++}
++
++// Chat header's audio/video call buttons -> Call.jsx. Same
++// presence-for-"is the other person here"/broadcast-for-signals
++// mechanism as joinLiveStream, kept as its own export because the
++// payloads mean something different (call control signals, not chat
++// lines) — see Call.jsx's own comment for what this does and doesn't
++// cover (peer connection/audio/video transport is not this; this is
++// only "did the other participant open the same call").
++export function joinCall(conversationId, { onPeerCountChange, onSignal }) {
++  if (!client) return { leave: () => {}, sendSignal: () => {} }
++  const channel = client.channel(`call:${conversationId}`, {
++    config: { presence: { key: crypto.randomUUID() } },
++  })
++  channel
++    .on('presence', { event: 'sync' }, () => {
++      onPeerCountChange(Object.keys(channel.presenceState()).length)
++    })
++    .on('broadcast', { event: 'signal' }, ({ payload }) => onSignal(payload))
++    .subscribe(async (status) => {
++      if (status === 'SUBSCRIBED') await channel.track({ joinedAt: Date.now() })
++    })
++  return {
++    leave: () => client.removeChannel(channel),
++    sendSignal: (signal) => channel.send({ type: 'broadcast', event: 'signal', payload: signal }),
++  }
++}
++
++// Live-stream viewer presence + chat. Both ephemeral by design (see
++// docs/migrations/015_live_streams.sql's comment on why chat isn't a
++// table) — Presence tracks who's currently in the channel for the
++// viewer count, Broadcast fans out chat lines to everyone in it right
++// now. Neither persists after everyone leaves, which is the right
++// behavior for a live chat, not a gap.
++export function joinLiveStream(streamId, { onViewerCountChange, onChat }) {
++  if (!client) return { leave: () => {}, sendChat: () => {} }
++  const channel = client.channel(`live:${streamId}`, {
++    config: { presence: { key: crypto.randomUUID() } },
++  })
++  channel
++    .on('presence', { event: 'sync' }, () => {
++      onViewerCountChange(Object.keys(channel.presenceState()).length)
++    })
++    .on('broadcast', { event: 'chat' }, ({ payload }) => onChat(payload))
++    .subscribe(async (status) => {
++      if (status === 'SUBSCRIBED') await channel.track({ joinedAt: Date.now() })
++    })
++  return {
++    leave: () => client.removeChannel(channel),
++    sendChat: (message) => channel.send({ type: 'broadcast', event: 'chat', payload: message }),
++  }
++}
++
++// Cross-device/cross-tab settings sync: flipping a toggle in one signed-in
++// session updates every other open session for the same account within
++// this subscription, instead of only on that session's next full reload.
++export function subscribeToSettings(userId, onChange) {
++  if (!client || !userId) return () => {}
++  const channel = client
++    .channel(`user_settings:${userId}`)
++    .on(
++      'postgres_changes',
++      { event: '*', schema: 'public', table: 'user_settings', filter: `user_id=eq.${userId}` },
++      (payload) => onChange(payload.new)
++    )
++    .subscribe()
++  return () => client.removeChannel(channel)
++}
+diff --git a/src/components/AppLayout.jsx b/src/components/AppLayout.jsx
+index 8aefcb1..cf57f66 100644
+--- a/src/components/AppLayout.jsx
++++ b/src/components/AppLayout.jsx
+@@ -2,11 +2,20 @@ import React from 'react'
+ import { Navigate, Outlet } from 'react-router-dom'
+ import { WifiOff } from 'lucide-react'
+ import { useApp } from '../context/AppContext.jsx'
++import { useKeyboardInset } from '../utils/useKeyboardInset.js'
+ import BottomNav from './BottomNav.jsx'
+ import ToastStack from './ToastStack.jsx'
+ 
+ export default function AppLayout() {
+   const { isAuthenticated, isOffline } = useApp()
++  // Global, not per-page: any open keyboard (chat, comments, search, a
++  // caption field) hides BottomNav entirely rather than leaving it to
++  // sit underneath — and drops the pb-20 space reserved for it, so the
++  // page below gets that room back instead of an empty gap sitting
++  // above the keyboard. See useKeyboardInset.js for why this is a
++  // measured value, not a guessed constant.
++  const keyboardInset = useKeyboardInset()
++  const keyboardOpen = keyboardInset > 0
+ 
+   if (!isAuthenticated) {
+     return <Navigate to="/signin" replace />
+@@ -19,10 +28,10 @@ export default function AppLayout() {
+           <WifiOff className="h-3 w-3" /> You're offline — showing saved content
+         </div>
+       )}
+-      <div className="flex-1 pb-20">
++      <div className={`flex-1 ${keyboardOpen ? '' : 'pb-20'}`}>
+         <Outlet />
+       </div>
+-      <BottomNav />
++      {!keyboardOpen && <BottomNav />}
+       <ToastStack />
+     </div>
+   )
+diff --git a/src/components/StatCard.jsx b/src/components/StatCard.jsx
+new file mode 100644
+index 0000000..5752acb
+--- /dev/null
++++ b/src/components/StatCard.jsx
+@@ -0,0 +1,10 @@
++import React from 'react'
++
++export default function StatCard({ label, value }) {
++  return (
++    <div className="rounded-xl border border-ink-100 bg-white p-3.5">
++      <p className="text-xl font-display font-bold text-navy-900">{value}</p>
++      <p className="mt-0.5 text-xs text-ink-500">{label}</p>
++    </div>
++  )
++}
+diff --git a/src/context/AppContext.jsx b/src/context/AppContext.jsx
+index b561f9d..f25eb17 100644
+--- a/src/context/AppContext.jsx
++++ b/src/context/AppContext.jsx
+@@ -73,6 +73,7 @@ const EMPTY_USER = {
+   posts: 0,
+   topics: [],
+   avatarUrl: null,
++  accountType: 'user',
+ }
+ 
+ export function AppProvider({ children }) {
+@@ -849,6 +850,45 @@ export function AppProvider({ children }) {
+     [currentUser.id, pushToast]
+   )
+ 
++  // Settings -> Your Experience -> Topics & interests. Same persistence
++  // completeOnboarding uses (interests live on the profile row, not a
++  // separate settings table), just callable any time after onboarding
++  // rather than only once at signup.
++  const updateInterests = useCallback(
++    (topics) => {
++      const previous = currentUser.topics
++      setSelectedTopics(topics)
++      setCurrentUser((u) => ({ ...u, topics }))
++      if (!isLive) return
++      api.updateProfile(currentUser.id, { interests: topics }).catch(() => {
++        setSelectedTopics(previous)
++        setCurrentUser((u) => ({ ...u, topics: previous }))
++        pushToast('Could not save your interests — please try again.')
++      })
++    },
++    [currentUser.id, currentUser.topics, pushToast]
++  )
++
++
++  // other settings write in this file: flips currentUser.accountType
++  // immediately (Settings/AccountType.jsx reflect it right away), then
++  // reconciles with the server and reverts + toasts on failure. Mock
++  // mode has no roles table to persist against, so it just keeps the
++  // optimistic value, same as every other mock-mode setting here.
++  const updateAccountType = useCallback(
++    (accountType) => {
++      const previous = currentUser.accountType
++      if (previous === accountType) return
++      setCurrentUser((u) => ({ ...u, accountType }))
++      if (!isLive) return
++      api.updateAccountType(accountType).catch(() => {
++        setCurrentUser((u) => ({ ...u, accountType: previous }))
++        pushToast('Could not update your account type — please try again.')
++      })
++    },
++    [currentUser.accountType, pushToast]
++  )
++
+   // ---------------------------------------------------------------------
+   // Feed / social actions — each keeps the exact original optimistic-update
+   // shape for mock mode, and additionally fires the real API call (with
+@@ -1626,6 +1666,8 @@ export function AppProvider({ children }) {
+     deleteAccount,
+     submitReport,
+     completeOnboarding,
++    updateInterests,
++    updateAccountType,
+     toggleLike,
+     toggleSave,
+     repost,
+diff --git a/src/data/mockData.js b/src/data/mockData.js
+index daaafa0..1cbd9e9 100644
+--- a/src/data/mockData.js
++++ b/src/data/mockData.js
+@@ -66,6 +66,7 @@ export const USERS = {
+     following: 892,
+     posts: 1200,
+     topics: ['India News', 'Tech', 'Climate', 'Education'],
++    accountType: 'user',
+   },
+   rohit: { id: 'rohit', name: 'Rohit Verma', handle: '@rohit.verma', verified: false, avatarColor: 'from-blue-400 to-blue-600', initials: 'RV' },
+   ananya: { id: 'ananya', name: 'Ananya Singh', handle: '@ananya.singh', verified: false, avatarColor: 'from-pink-400 to-rose-600', initials: 'AS' },
+diff --git a/src/pages/AccountType.jsx b/src/pages/AccountType.jsx
+index 8ddd89c..e3b75f3 100644
+--- a/src/pages/AccountType.jsx
++++ b/src/pages/AccountType.jsx
+@@ -1,49 +1,29 @@
+ import React from 'react'
+-import { useNavigate } from 'react-router-dom'
+ import PageHeader from '../components/PageHeader.jsx'
++import { useApp } from '../context/AppContext.jsx'
+ 
+-// The only account type that actually exists in the schema today is
+-// Personal (see docs/bharatspace_level1_schema.sql — there is no
+-// account_type column at all yet) — switching *to* it is therefore a
+-// no-op, and Creator/Brand are honestly represented as ComingSoon
+-// destinations rather than silently marked "built" just for having a
+-// settings row now. This used to be a quick-picker in Profile.jsx's •••
+-// menu; it moved here so that menu could be reduced to a single
+-// shortcut into Settings instead of duplicating rows Settings already
+-// has (Profile & identity for editing, Sign out at the bottom, and this).
++// Switches which role in the existing roles/user_roles table (see
++// docs/bharatspace_level1_schema.sql, docs/migrations/014_community_role.sql)
++// is this account's active type. This used to be a permanent ComingSoon
++// screen because that table only had a seat for Personal — 014 added
++// Community, closing the last gap, so all four now actually persist via
++// PATCH /v1/account/type (backend/src/routes/account.js).
++//
++// What switching does today: changes the badge/label on your profile
++// and which Settings sections show (Money & Business and Your Insights
++// read this to decide what to display). It does not yet build you a
++// separate "Creator Studio" dashboard or a campaign-management surface
++// for Brand — those are real, larger features, described honestly where
++// they still don't exist rather than implied here.
+ const ACCOUNT_TYPES = [
+-  { id: 'personal', label: 'Personal', description: 'The standard account everyone starts with.' },
+-  {
+-    id: 'creator',
+-    label: 'Creator',
+-    description: 'A dashboard for your content, audience insights and brand collaborations.',
+-    comingSoon: {
+-      title: 'Creator Studio',
+-      description: 'A dashboard for your content, audience insights and brand collaborations.',
+-      bullets: ['Portfolio and media kit', 'Audience and growth insights', 'Brand collaboration requests', 'Rate card and availability'],
+-    },
+-  },
+-  {
+-    id: 'brand',
+-    label: 'Brand',
+-    description: 'Run campaigns and find creators to partner with.',
+-    comingSoon: {
+-      title: 'Brand Studio',
+-      description: 'Run campaigns and find creators to partner with, right from your account.',
+-      bullets: ['Company profile and products', 'Create and manage campaigns', 'Find and filter creators', 'Track collaborations'],
+-    },
+-  },
++  { id: 'user', label: 'Personal', description: 'The standard account. No business or creator tools shown in Settings.' },
++  { id: 'creator', label: 'Creator', description: 'Adds monetization eligibility and content-performance insights to Settings.' },
++  { id: 'brand', label: 'Brand', description: 'Adds business tools and audience insights to Settings.' },
++  { id: 'community', label: 'Community', description: 'For an account run on behalf of a group — insights are framed around members rather than followers.' },
+ ]
+ 
+ export default function AccountType() {
+-  const navigate = useNavigate()
+-
+-  const handlePick = (type) => {
+-    if (type.id !== 'personal') {
+-      navigate('/coming-soon', { state: type.comingSoon })
+-    }
+-    // Personal is already the only account type that exists — nothing to persist.
+-  }
++  const { currentUser, updateAccountType } = useApp()
+ 
+   return (
+     <div>
+@@ -51,21 +31,24 @@ export default function AccountType() {
+       <div className="p-4">
+         <p className="mb-4 text-sm text-ink-500">Choose how your account works. You can switch back at any time.</p>
+         <div className="flex flex-col gap-2.5">
+-          {ACCOUNT_TYPES.map((t) => (
+-            <button
+-              key={t.id}
+-              onClick={() => handlePick(t)}
+-              className={`flex items-center justify-between rounded-xl border p-4 text-left transition-colors ${
+-                t.id === 'personal' ? 'border-saffron-500 bg-saffron-50' : 'border-ink-200'
+-              }`}
+-            >
+-              <div>
+-                <p className={`text-sm font-bold ${t.id === 'personal' ? 'text-saffron-700' : 'text-ink-900'}`}>{t.label}</p>
+-                <p className="mt-0.5 text-xs text-ink-500">{t.description}</p>
+-              </div>
+-              {t.id === 'personal' && <span className="shrink-0 text-[11px] font-semibold text-saffron-600">Current</span>}
+-            </button>
+-          ))}
++          {ACCOUNT_TYPES.map((t) => {
++            const isCurrent = currentUser.accountType === t.id
++            return (
++              <button
++                key={t.id}
++                onClick={() => updateAccountType(t.id)}
++                className={`flex items-center justify-between rounded-xl border p-4 text-left transition-colors ${
++                  isCurrent ? 'border-saffron-500 bg-saffron-50' : 'border-ink-200'
++                }`}
++              >
++                <div>
++                  <p className={`text-sm font-bold ${isCurrent ? 'text-saffron-700' : 'text-ink-900'}`}>{t.label}</p>
++                  <p className="mt-0.5 text-xs text-ink-500">{t.description}</p>
++                </div>
++                {isCurrent && <span className="shrink-0 text-[11px] font-semibold text-saffron-600">Current</span>}
++              </button>
++            )
++          })}
+         </div>
+       </div>
+     </div>
+diff --git a/src/pages/Call.jsx b/src/pages/Call.jsx
+new file mode 100644
+index 0000000..49f8a27
+--- /dev/null
++++ b/src/pages/Call.jsx
+@@ -0,0 +1,115 @@
++import React, { useEffect, useRef, useState } from 'react'
++import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
++import { PhoneOff, Mic, MicOff, Video as VideoIcon, VideoOff, Users } from 'lucide-react'
++import { useApp } from '../context/AppContext.jsx'
++import { joinCall } from '../api/realtime.js'
++
++// ChatThread.jsx's audio/video call buttons -> here (/call/:conversationId/:mode).
++// What's real: local mic/camera preview and permission handling, a
++// Realtime presence check for whether the other participant has also
++// opened this call (peerCount), and a broadcast "hangup" signal so
++// either side ending the call closes it for both. What's not built:
++// actually carrying audio/video *to* the other participant — that's a
++// WebRTC peer connection (SDP offer/answer + STUN/TURN for NAT
++// traversal), the same category of gap LiveGo.jsx/LiveView.jsx flag for
++// streaming, and it needs the same infra decision before it can be real
++// rather than simulated.
++export default function Call() {
++  const { conversationId, mode } = useParams()
++  const [searchParams] = useSearchParams()
++  const navigate = useNavigate()
++  const { getUser } = useApp()
++  const [muted, setMuted] = useState(false)
++  const [cameraOff, setCameraOff] = useState(mode !== 'video')
++  const [peerCount, setPeerCount] = useState(0)
++  const videoRef = useRef(null)
++  const streamRef = useRef(null)
++  const callRef = useRef(null)
++
++  useEffect(() => {
++    let cancelled = false
++    navigator.mediaDevices
++      .getUserMedia({ video: mode === 'video', audio: true })
++      .then((stream) => {
++        if (cancelled) {
++          stream.getTracks().forEach((t) => t.stop())
++          return
++        }
++        streamRef.current = stream
++        if (videoRef.current) videoRef.current.srcObject = stream
++      })
++      .catch(() => {})
++
++    callRef.current = joinCall(conversationId, {
++      onPeerCountChange: setPeerCount,
++      onSignal: (signal) => {
++        if (signal.type === 'hangup') navigate(-1)
++      },
++    })
++
++    return () => {
++      cancelled = true
++      streamRef.current?.getTracks().forEach((t) => t.stop())
++      callRef.current?.leave()
++    }
++  }, [conversationId, mode, navigate])
++
++  const toggleMic = () => {
++    streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = muted))
++    setMuted((m) => !m)
++  }
++
++  const toggleCamera = () => {
++    streamRef.current?.getVideoTracks().forEach((t) => (t.enabled = cameraOff))
++    setCameraOff((c) => !c)
++  }
++
++  const handleHangup = () => {
++    callRef.current?.sendSignal({ type: 'hangup' })
++    navigate(-1)
++  }
++
++  const otherUser = getUser(searchParams.get('peer'))
++
++  return (
++    <div className="flex h-full flex-col items-center justify-between bg-navy-950 py-10 text-white">
++      <div className="flex flex-col items-center gap-2">
++        <p className="text-sm text-white/60">{mode === 'video' ? 'Video call' : 'Audio call'}</p>
++        <p className="flex items-center gap-1.5 text-sm text-white/60">
++          <Users className="h-3.5 w-3.5" />
++          {peerCount > 1 ? 'Connected' : `Waiting for ${otherUser?.name || 'the other person'} to join…`}
++        </p>
++      </div>
++
++      {mode === 'video' && !cameraOff ? (
++        <div className="relative aspect-[3/4] w-56 overflow-hidden rounded-2xl bg-black">
++          <video ref={videoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
++          <p className="absolute bottom-1 left-1 right-1 text-center text-[9px] text-white/60">Your preview only</p>
++        </div>
++      ) : (
++        <div className="flex h-24 w-24 items-center justify-center rounded-full bg-white/10 text-3xl font-bold">
++          {otherUser?.name?.[0] || '?'}
++        </div>
++      )}
++
++      <p className="max-w-[240px] text-center text-[11px] text-white/40">
++        Audio/video isn't carried to the other person yet — that needs a media-server piece that isn't connected. This
++        screen's controls and connection status are live.
++      </p>
++
++      <div className="flex items-center gap-5">
++        <button onClick={toggleMic} className="rounded-full bg-white/10 p-4">
++          {muted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
++        </button>
++        {mode === 'video' && (
++          <button onClick={toggleCamera} className="rounded-full bg-white/10 p-4">
++            {cameraOff ? <VideoOff className="h-5 w-5" /> : <VideoIcon className="h-5 w-5" />}
++          </button>
++        )}
++        <button onClick={handleHangup} className="rounded-full bg-bharat-red p-4">
++          <PhoneOff className="h-5 w-5" />
++        </button>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/ChatThread.jsx b/src/pages/ChatThread.jsx
+index 7869f26..28c351f 100644
+--- a/src/pages/ChatThread.jsx
++++ b/src/pages/ChatThread.jsx
+@@ -1,6 +1,6 @@
+ import React, { useEffect, useRef, useState } from 'react'
+ import { useNavigate, useParams } from 'react-router-dom'
+-import { Send, Trash2 } from 'lucide-react'
++import { Send, Trash2, Phone, Video } from 'lucide-react'
+ import PageHeader from '../components/PageHeader.jsx'
+ import Avatar from '../components/Avatar.jsx'
+ import { useApp } from '../context/AppContext.jsx'
+@@ -138,6 +138,26 @@ export default function ChatThread() {
+           </button>
+         }
+         showBack
++        right={
++          conversation && (
++            <div className="flex items-center gap-1">
++              <button
++                onClick={() => otherUser && navigate(`/call/${conversation.id}/audio?peer=${otherUser.id}`)}
++                className="focus-ring rounded-full p-2 text-ink-700 transition-transform active:scale-90"
++                aria-label="Audio call"
++              >
++                <Phone className="h-5 w-5" />
++              </button>
++              <button
++                onClick={() => otherUser && navigate(`/call/${conversation.id}/video?peer=${otherUser.id}`)}
++                className="focus-ring rounded-full p-2 text-ink-700 transition-transform active:scale-90"
++                aria-label="Video call"
++              >
++                <Video className="h-5 w-5" />
++              </button>
++            </div>
++          )
++        }
+       />
+ 
+       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+diff --git a/src/pages/HelpSupport.jsx b/src/pages/HelpSupport.jsx
+new file mode 100644
+index 0000000..8265583
+--- /dev/null
++++ b/src/pages/HelpSupport.jsx
+@@ -0,0 +1,108 @@
++import React, { useEffect, useState } from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++
++// Settings -> Tools & Support -> Help & support. Real submission +
++// status list (backend/src/routes/support.js, docs/migrations/016).
++// No admin UI reviews these yet — same tradeoff as reports.js's content
++// reports, reviewed via Supabase's Table Editor for now.
++export default function HelpSupport() {
++  const { pushToast } = useApp()
++  const [tickets, setTickets] = useState(null)
++  const [subject, setSubject] = useState('')
++  const [body, setBody] = useState('')
++  const [submitting, setSubmitting] = useState(false)
++
++  const load = () => {
++    if (!isLive) {
++      setTickets([])
++      return
++    }
++    api.getSupportTickets().then((r) => setTickets(r.tickets)).catch(() => setTickets([]))
++  }
++  useEffect(load, [])
++
++  const handleSubmit = async (e) => {
++    e.preventDefault()
++    if (!subject.trim() || !body.trim()) {
++      pushToast('Fill in both a subject and a message')
++      return
++    }
++    if (!isLive) {
++      pushToast('Connect the live backend to submit support requests')
++      return
++    }
++    setSubmitting(true)
++    try {
++      await api.createSupportTicket(subject.trim(), body.trim())
++      setSubject('')
++      setBody('')
++      pushToast('Request submitted — we\u2019ll get back to you')
++      load()
++    } catch (err) {
++      pushToast(err.message || 'Could not submit your request — please try again.')
++    } finally {
++      setSubmitting(false)
++    }
++  }
++
++  return (
++    <div>
++      <PageHeader title="Help & support" showBack />
++      <div className="p-4">
++        <form onSubmit={handleSubmit} className="rounded-xl border border-ink-100 bg-white p-3.5">
++          <p className="text-sm font-semibold text-ink-900">Submit a request</p>
++          <input
++            value={subject}
++            onChange={(e) => setSubject(e.target.value)}
++            maxLength={120}
++            placeholder="Subject"
++            className="mt-2.5 w-full rounded-lg border border-ink-200 px-3 py-2 text-sm focus-ring"
++          />
++          <textarea
++            value={body}
++            onChange={(e) => setBody(e.target.value)}
++            maxLength={2000}
++            rows={4}
++            placeholder="Describe the issue…"
++            className="mt-2 w-full resize-none rounded-lg border border-ink-200 px-3 py-2 text-sm focus-ring"
++          />
++          <button
++            type="submit"
++            disabled={submitting}
++            className="mt-2.5 w-full rounded-full bg-saffron-gradient py-2.5 text-sm font-bold text-navy-950 disabled:opacity-60"
++          >
++            {submitting ? 'Submitting…' : 'Submit'}
++          </button>
++        </form>
++
++        <p className="mb-2 mt-5 text-xs font-semibold text-ink-500">Your requests</p>
++        {tickets === null ? (
++          <div className="skeleton h-14 rounded-xl" />
++        ) : tickets.length === 0 ? (
++          <p className="text-sm text-ink-500">No requests yet.</p>
++        ) : (
++          <div className="flex flex-col gap-2">
++            {tickets.map((t) => (
++              <div key={t.id} className="rounded-xl border border-ink-100 bg-white p-3">
++                <div className="flex items-center justify-between">
++                  <p className="text-sm font-semibold text-ink-900">{t.subject}</p>
++                  <span
++                    className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${
++                      t.status === 'resolved' ? 'bg-emerald-100 text-emerald-700' : 'bg-saffron-100 text-saffron-700'
++                    }`}
++                  >
++                    {t.status === 'resolved' ? 'Resolved' : 'Open'}
++                  </span>
++                </div>
++                <p className="mt-1 line-clamp-2 text-xs text-ink-500">{t.body}</p>
++              </div>
++            ))}
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/Home.jsx b/src/pages/Home.jsx
+index 4b9a120..12d6196 100644
+--- a/src/pages/Home.jsx
++++ b/src/pages/Home.jsx
+@@ -1,11 +1,13 @@
+ import React, { useEffect, useMemo, useRef, useState } from 'react'
+ import { useNavigate } from 'react-router-dom'
+-import { Radio, Loader2 } from 'lucide-react'
++import { Radio, Loader2, Plus } from 'lucide-react'
+ import HomeTopNav from '../components/HomeTopNav.jsx'
+ import PostCard from '../components/PostCard.jsx'
+ import PullToRefresh from '../components/PullToRefresh.jsx'
+ import { useApp } from '../context/AppContext.jsx'
+ import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++import { subscribeToLiveStreams } from '../api/realtime.js'
+ import { FEED_TABS, HIGHLIGHTS } from '../data/mockData.js'
+ 
+ // Frontend-only for now (see docs/PRODUCT_DIRECTION_UPDATE.md — Stories
+@@ -26,9 +28,23 @@ const STORIES_PREVIEW = {
+ export default function Home() {
+   const { posts, fetchPostsLive, fetchMorePosts, hasMorePosts, loadingMorePosts, fetchConversationsLive } = useApp()
+   const [activeTab, setActiveTab] = useState('For You')
++  const [liveStreams, setLiveStreams] = useState([])
+   const sentinelRef = useRef(null)
+   const navigate = useNavigate()
+ 
++  // The one card at the front of this rail that's real, not mock: who's
++  // currently live (docs/migrations/015_live_streams.sql). Loaded once,
++  // then kept current by Realtime instead of polling — see
++  // subscribeToLiveStreams in api/realtime.js.
++  const refreshLiveStreams = () => {
++    if (!isLive) return
++    api.getActiveLiveStreams().then((res) => setLiveStreams(res.streams || [])).catch(() => {})
++  }
++  useEffect(() => {
++    refreshLiveStreams()
++    return subscribeToLiveStreams(refreshLiveStreams)
++  }, [])
++
+   // Deliberately not part of AppContext's auth bootstrap effect — Home is
+   // the first authenticated screen almost every session actually lands
+   // on, so firing this from here (not blocking anything above it) gets
+@@ -81,6 +97,32 @@ export default function Home() {
+       </div>
+ 
+       <div className="flex gap-3 overflow-x-auto no-scrollbar bg-white px-4 py-4">
++        <button
++          onClick={() => navigate('/live/go')}
++          className="relative flex h-28 w-24 shrink-0 flex-col items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-bharat-red/40 bg-bharat-red/5 text-bharat-red"
++        >
++          <span className="flex h-9 w-9 items-center justify-center rounded-full bg-bharat-red text-white">
++            <Plus className="h-5 w-5" />
++          </span>
++          <span className="text-xs font-bold">Go Live</span>
++        </button>
++
++        {liveStreams.map((s) => (
++          <button
++            key={s.id}
++            onClick={() => navigate(`/live/${s.id}`)}
++            className="relative flex h-28 w-24 shrink-0 flex-col justify-between rounded-xl bg-gradient-to-br from-navy-800 to-navy-950 p-2.5 text-left text-white shadow-card"
++          >
++            <span className="absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-full bg-bharat-red px-1.5 py-0.5 text-[8px] font-bold">
++              <Radio className="h-2 w-2" /> Live
++            </span>
++            <div className="mt-auto">
++              <p className="text-xs font-bold leading-tight">{s.hostName}</p>
++              <p className="mt-0.5 truncate text-[9.5px] leading-tight text-white/80">{s.title}</p>
++            </div>
++          </button>
++        ))}
++
+         {HIGHLIGHTS.map((h) => (
+           <button
+             key={h.id}
+diff --git a/src/pages/InsightsAudience.jsx b/src/pages/InsightsAudience.jsx
+new file mode 100644
+index 0000000..e76501d
+--- /dev/null
++++ b/src/pages/InsightsAudience.jsx
+@@ -0,0 +1,62 @@
++import React, { useEffect, useState } from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import StatCard from '../components/StatCard.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++
++export default function InsightsAudience() {
++  const { currentUser } = useApp()
++  const [data, setData] = useState(null)
++  const communityWords = currentUser.accountType === 'community'
++
++  useEffect(() => {
++    if (isLive) {
++      api.getInsightsAudience().then(setData).catch(() => setData(false))
++      return
++    }
++    // Mock mode has no per-follow timestamp to build a real trend from —
++    // shown as a flat/empty trend rather than invented numbers.
++    setData({
++      followerCount: currentUser.followers,
++      followingCount: currentUser.following,
++      weeklyNewFollowers: Array.from({ length: 6 }, () => ({ count: 0 })),
++    })
++  }, [currentUser.id])
++
++  const maxWeek = data && data !== false ? Math.max(1, ...data.weeklyNewFollowers.map((w) => w.count)) : 1
++
++  return (
++    <div>
++      <PageHeader title="Audience" showBack />
++      <div className="p-4">
++        {!data ? (
++          <div className="skeleton h-40 rounded-xl" />
++        ) : data === false ? (
++          <p className="py-10 text-center text-sm text-ink-500">Could not load your audience insights — please try again.</p>
++        ) : (
++          <>
++            <div className="grid grid-cols-2 gap-3">
++              <StatCard label={communityWords ? 'Members' : 'Followers'} value={data.followerCount.toLocaleString()} />
++              <StatCard label="Following" value={data.followingCount.toLocaleString()} />
++            </div>
++            <p className="mb-2 mt-5 text-xs font-semibold text-ink-500">
++              New {communityWords ? 'members' : 'followers'} — last 6 weeks
++            </p>
++            <div className="flex h-28 items-end gap-2">
++              {data.weeklyNewFollowers.map((w, i) => (
++                <div key={i} className="flex flex-1 flex-col items-center gap-1">
++                  <div
++                    className="w-full rounded-t-md bg-saffron-400"
++                    style={{ height: `${Math.max(4, (w.count / maxWeek) * 100)}%` }}
++                  />
++                  <span className="text-[10px] text-ink-400">{w.count}</span>
++                </div>
++              ))}
++            </div>
++          </>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/InsightsContent.jsx b/src/pages/InsightsContent.jsx
+new file mode 100644
+index 0000000..ff0d26f
+--- /dev/null
++++ b/src/pages/InsightsContent.jsx
+@@ -0,0 +1,50 @@
++import React, { useEffect, useState } from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++
++export default function InsightsContent() {
++  const { currentUser, posts } = useApp()
++  const [rows, setRows] = useState(null)
++
++  useEffect(() => {
++    if (isLive) {
++      api.getInsightsContent().then((r) => setRows(r.posts)).catch(() => setRows([]))
++      return
++    }
++    const mine = posts
++      .filter((p) => p.authorId === currentUser.id)
++      .map((p) => ({ id: p.id, body: p.text, createdAt: p.time, likeCount: p.likes || 0, commentCount: p.comments || 0 }))
++      .sort((a, b) => b.likeCount + b.commentCount - (a.likeCount + a.commentCount))
++    setRows(mine)
++  }, [currentUser.id, posts])
++
++  return (
++    <div>
++      <PageHeader title="Content insights" showBack />
++      <div className="p-4">
++        {!rows ? (
++          <div className="flex flex-col gap-2">
++            {[0, 1, 2].map((i) => (
++              <div key={i} className="skeleton h-16 rounded-xl" />
++            ))}
++          </div>
++        ) : rows.length === 0 ? (
++          <p className="py-10 text-center text-sm text-ink-500">Nothing to show yet — post something and check back.</p>
++        ) : (
++          <div className="flex flex-col gap-2">
++            {rows.map((p) => (
++              <div key={p.id} className="rounded-xl border border-ink-100 bg-white p-3.5">
++                <p className="line-clamp-2 text-sm text-ink-900">{p.body || '(No caption)'}</p>
++                <p className="mt-2 text-xs font-semibold text-ink-500">
++                  {p.likeCount.toLocaleString()} likes · {p.commentCount.toLocaleString()} comments
++                </p>
++              </div>
++            ))}
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/InsightsDiscovery.jsx b/src/pages/InsightsDiscovery.jsx
+new file mode 100644
+index 0000000..b3ac8b2
+--- /dev/null
++++ b/src/pages/InsightsDiscovery.jsx
+@@ -0,0 +1,58 @@
++import React, { useEffect, useState } from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import StatCard from '../components/StatCard.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++
++// "Recommendations insights" in the spec asks how content is being
++// discovered. There's no impression/view tracking in this schema to
++// measure reach directly (see backend/src/routes/insights.js's comment),
++// so this uses the honest signal that *is* available: how much of your
++// engagement comes from people who don't already follow you — real
++// discovery beyond your existing audience, not a made-up "reach" number.
++export default function InsightsDiscovery() {
++  const { currentUser } = useApp()
++  const [data, setData] = useState(null)
++
++  useEffect(() => {
++    if (!isLive) {
++      setData(null)
++      return
++    }
++    api.getInsightsDiscovery().then(setData).catch(() => setData(false))
++  }, [currentUser.id])
++
++  const total = data && data !== false ? data.followerEngagement + data.nonFollowerEngagement : 0
++  const pct = total ? Math.round((data.nonFollowerEngagement / total) * 100) : 0
++
++  return (
++    <div>
++      <PageHeader title="Recommendations insights" showBack />
++      <div className="p-4">
++        {!isLive ? (
++          <p className="py-10 text-center text-sm text-ink-500">
++            This needs the live backend connected — mock mode doesn't track who engaged with what.
++          </p>
++        ) : !data ? (
++          <div className="skeleton h-32 rounded-xl" />
++        ) : data === false ? (
++          <p className="py-10 text-center text-sm text-ink-500">Could not load this — please try again.</p>
++        ) : total === 0 ? (
++          <p className="py-10 text-center text-sm text-ink-500">Not enough engagement yet to show this.</p>
++        ) : (
++          <>
++            <div className="grid grid-cols-2 gap-3">
++              <StatCard label="From your followers" value={data.followerEngagement.toLocaleString()} />
++              <StatCard label="From new people" value={data.nonFollowerEngagement.toLocaleString()} />
++            </div>
++            <p className="mt-4 text-sm text-ink-700">
++              <span className="font-bold text-saffron-600">{pct}%</span> of the people engaging with your posts don't
++              follow you yet — that's your content reaching beyond your existing audience.
++            </p>
++          </>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/InsightsOverview.jsx b/src/pages/InsightsOverview.jsx
+new file mode 100644
+index 0000000..c3334e4
+--- /dev/null
++++ b/src/pages/InsightsOverview.jsx
+@@ -0,0 +1,60 @@
++import React, { useEffect, useState } from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import StatCard from '../components/StatCard.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++
++// Settings -> Your Insights -> Overview. Every number here is a real
++// aggregate (backend/src/routes/insights.js) over this account's own
++// posts/reactions/comments/follows — nothing is a placeholder. In mock
++// mode (no backend configured) it computes the same shape from the
++// locally-loaded `posts` array instead of a fetch, so the screen is
++// never silently empty just because there's no live backend to call.
++export default function InsightsOverview() {
++  const { currentUser, posts } = useApp()
++  const [data, setData] = useState(null)
++  const communityWords = currentUser.accountType === 'community'
++
++  useEffect(() => {
++    if (isLive) {
++      api.getInsightsOverview().then(setData).catch(() => setData(false))
++      return
++    }
++    const mine = posts.filter((p) => p.authorId === currentUser.id)
++    setData({
++      postCount: mine.length,
++      followerCount: currentUser.followers,
++      followingCount: currentUser.following,
++      totalLikes: mine.reduce((sum, p) => sum + (p.likes || 0), 0),
++      totalComments: mine.reduce((sum, p) => sum + (p.comments || 0), 0),
++      newFollowersThisWeek: 0,
++    })
++  }, [currentUser.id, posts])
++
++  return (
++    <div>
++      <PageHeader title="Overview" showBack />
++      <div className="p-4">
++        {!data ? (
++          <div className="grid grid-cols-2 gap-3">
++            {[0, 1, 2, 3].map((i) => (
++              <div key={i} className="skeleton h-20 rounded-xl" />
++            ))}
++          </div>
++        ) : data === false ? (
++          <p className="py-10 text-center text-sm text-ink-500">Could not load your insights — please try again.</p>
++        ) : (
++          <div className="grid grid-cols-2 gap-3">
++            <StatCard label={communityWords ? 'Members' : 'Followers'} value={data.followerCount.toLocaleString()} />
++            <StatCard label="New this week" value={data.newFollowersThisWeek.toLocaleString()} />
++            <StatCard label="Posts" value={data.postCount.toLocaleString()} />
++            <StatCard label="Total likes" value={data.totalLikes.toLocaleString()} />
++            <StatCard label="Total comments" value={data.totalComments.toLocaleString()} />
++            <StatCard label="Following" value={data.followingCount.toLocaleString()} />
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/LiveGo.jsx b/src/pages/LiveGo.jsx
+new file mode 100644
+index 0000000..4e62b66
+--- /dev/null
++++ b/src/pages/LiveGo.jsx
+@@ -0,0 +1,160 @@
++import React, { useEffect, useRef, useState } from 'react'
++import { useNavigate } from 'react-router-dom'
++import { Radio, X, Send, Users } from 'lucide-react'
++import PageHeader from '../components/PageHeader.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import * as api from '../api/client.js'
++import { isLive } from '../api/client.js'
++import { joinLiveStream } from '../api/realtime.js'
++
++// Home.jsx's "Go Live" card -> here. What's real: the session row
++// (docs/migrations/015_live_streams.sql — shows up for every viewer the
++// moment you start, disappears the moment you end), the live viewer
++// count and chat below (Supabase Realtime Presence/Broadcast, no polling).
++// What's a local preview only: the camera feed — getUserMedia shows it
++// to *you* so this screen isn't a blank box, but nothing is sent to
++// anyone else. Actually delivering that feed to viewers needs a WebRTC
++// signaling/media-server piece this doesn't build, so LiveView.jsx (the
++// viewer's screen) says so plainly instead of showing a fake video.
++export default function LiveGo() {
++  const navigate = useNavigate()
++  const { currentUser, pushToast } = useApp()
++  const [title, setTitle] = useState('')
++  const [streamId, setStreamId] = useState(null)
++  const [starting, setStarting] = useState(false)
++  const [viewerCount, setViewerCount] = useState(0)
++  const [chatLog, setChatLog] = useState([])
++  const [chatText, setChatText] = useState('')
++  const videoRef = useRef(null)
++  const streamRef = useRef(null)
++  const liveChannelRef = useRef(null)
++
++  useEffect(() => {
++    return () => {
++      streamRef.current?.getTracks().forEach((t) => t.stop())
++      liveChannelRef.current?.leave()
++    }
++  }, [])
++
++  const handleStart = async () => {
++    if (!title.trim()) {
++      pushToast('Give your stream a title first')
++      return
++    }
++    setStarting(true)
++    try {
++      let id = `local-${Date.now()}`
++      if (isLive) {
++        const res = await api.startLiveStream(title.trim())
++        id = res.id
++      }
++      setStreamId(id)
++      liveChannelRef.current = joinLiveStream(id, {
++        onViewerCountChange: setViewerCount,
++        onChat: (msg) => setChatLog((prev) => [...prev.slice(-49), msg]),
++      })
++      try {
++        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
++        streamRef.current = stream
++        if (videoRef.current) videoRef.current.srcObject = stream
++      } catch {
++        pushToast('Camera/mic permission denied — you can still chat, but there\u2019s no preview')
++      }
++    } catch (err) {
++      pushToast(err.message || 'Could not start your stream — please try again.')
++    } finally {
++      setStarting(false)
++    }
++  }
++
++  const handleEnd = async () => {
++    streamRef.current?.getTracks().forEach((t) => t.stop())
++    liveChannelRef.current?.leave()
++    if (isLive && streamId && !streamId.startsWith('local-')) {
++      api.endLiveStream(streamId).catch(() => {})
++    }
++    navigate('/home')
++  }
++
++  const handleSendChat = (e) => {
++    e.preventDefault()
++    const text = chatText.trim()
++    if (!text) return
++    const msg = { author: currentUser.name, text }
++    liveChannelRef.current?.sendChat(msg)
++    setChatLog((prev) => [...prev.slice(-49), msg])
++    setChatText('')
++  }
++
++  if (!streamId) {
++    return (
++      <div>
++        <PageHeader title="Go Live" showBack />
++        <div className="p-4">
++          <label className="text-sm font-semibold text-ink-900">What are you going live about?</label>
++          <input
++            value={title}
++            onChange={(e) => setTitle(e.target.value)}
++            maxLength={80}
++            placeholder="Give your stream a title"
++            className="mt-2 w-full rounded-xl border border-ink-200 px-3.5 py-3 text-sm focus-ring"
++            autoFocus
++          />
++          <p className="mt-3 text-xs text-ink-500">
++            Once you start, this shows up live on everyone's Home feed with real viewer count and chat.
++          </p>
++          <button
++            onClick={handleStart}
++            disabled={starting}
++            className="mt-6 flex w-full items-center justify-center gap-2 rounded-full bg-bharat-red px-6 py-3.5 font-display text-[15px] font-bold text-white shadow-pop transition-transform active:scale-[0.98] disabled:opacity-60"
++          >
++            <Radio className="h-4 w-4" /> {starting ? 'Starting…' : 'Go Live'}
++          </button>
++        </div>
++      </div>
++    )
++  }
++
++  return (
++    <div className="flex h-full flex-col bg-navy-950 text-white">
++      <div className="flex items-center justify-between px-4 py-3">
++        <span className="flex items-center gap-1.5 rounded-full bg-bharat-red px-2.5 py-1 text-xs font-bold">
++          <Radio className="h-3 w-3" /> LIVE
++        </span>
++        <span className="flex items-center gap-1 text-sm font-semibold">
++          <Users className="h-4 w-4" /> {viewerCount}
++        </span>
++        <button onClick={handleEnd} className="rounded-full bg-white/10 p-2">
++          <X className="h-4 w-4" />
++        </button>
++      </div>
++
++      <div className="relative mx-4 aspect-[9/16] max-h-[45vh] overflow-hidden rounded-2xl bg-black">
++        <video ref={videoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
++        <p className="absolute bottom-2 left-2 right-2 text-center text-[10px] text-white/70">
++          Preview only — video isn't sent to viewers yet (needs a media server)
++        </p>
++      </div>
++
++      <div className="mt-3 flex-1 overflow-y-auto px-4">
++        {chatLog.map((m, i) => (
++          <p key={i} className="mb-1.5 text-sm">
++            <span className="font-semibold">{m.author}</span> <span className="text-white/80">{m.text}</span>
++          </p>
++        ))}
++      </div>
++
++      <form onSubmit={handleSendChat} className="flex items-center gap-2 border-t border-white/10 px-4 py-3">
++        <input
++          value={chatText}
++          onChange={(e) => setChatText(e.target.value)}
++          placeholder="Say something…"
++          className="flex-1 rounded-full bg-white/10 px-4 py-2 text-sm text-white placeholder:text-white/50 focus-ring"
++        />
++        <button type="submit" className="rounded-full bg-saffron-500 p-2">
++          <Send className="h-4 w-4 text-navy-950" />
++        </button>
++      </form>
++    </div>
++  )
++}
+diff --git a/src/pages/LiveView.jsx b/src/pages/LiveView.jsx
+new file mode 100644
+index 0000000..1bf12da
+--- /dev/null
++++ b/src/pages/LiveView.jsx
+@@ -0,0 +1,81 @@
++import React, { useEffect, useRef, useState } from 'react'
++import { useNavigate, useParams } from 'react-router-dom'
++import { Radio, X, Send, Users, VideoOff } from 'lucide-react'
++import { useApp } from '../context/AppContext.jsx'
++import { joinLiveStream } from '../api/realtime.js'
++
++// The viewer side of LiveGo.jsx. Deliberately shows a plain "no video
++// yet" placeholder instead of anything that looks like a stalled/broken
++// player — there is no video to show until a media-server piece exists
++// to relay the host's camera to viewers (see LiveGo.jsx's own comment).
++// Viewer count and chat are real, live, and shared with the host's
++// screen right now via the same Realtime channel.
++export default function LiveView() {
++  const { id } = useParams()
++  const navigate = useNavigate()
++  const { currentUser } = useApp()
++  const [viewerCount, setViewerCount] = useState(0)
++  const [chatLog, setChatLog] = useState([])
++  const [chatText, setChatText] = useState('')
++  const channelRef = useRef(null)
++
++  useEffect(() => {
++    channelRef.current = joinLiveStream(id, {
++      onViewerCountChange: setViewerCount,
++      onChat: (msg) => setChatLog((prev) => [...prev.slice(-49), msg]),
++    })
++    return () => channelRef.current?.leave()
++  }, [id])
++
++  const handleSendChat = (e) => {
++    e.preventDefault()
++    const text = chatText.trim()
++    if (!text) return
++    const msg = { author: currentUser.name, text }
++    channelRef.current?.sendChat(msg)
++    setChatLog((prev) => [...prev.slice(-49), msg])
++    setChatText('')
++  }
++
++  return (
++    <div className="flex h-full flex-col bg-navy-950 text-white">
++      <div className="flex items-center justify-between px-4 py-3">
++        <span className="flex items-center gap-1.5 rounded-full bg-bharat-red px-2.5 py-1 text-xs font-bold">
++          <Radio className="h-3 w-3" /> LIVE
++        </span>
++        <span className="flex items-center gap-1 text-sm font-semibold">
++          <Users className="h-4 w-4" /> {viewerCount}
++        </span>
++        <button onClick={() => navigate(-1)} className="rounded-full bg-white/10 p-2">
++          <X className="h-4 w-4" />
++        </button>
++      </div>
++
++      <div className="mx-4 flex aspect-[9/16] max-h-[45vh] flex-col items-center justify-center gap-2 rounded-2xl bg-black text-white/60">
++        <VideoOff className="h-8 w-8" />
++        <p className="px-6 text-center text-xs">Video isn't connected for this stream yet — chat and viewer count below are live.</p>
++      </div>
++
++      <div className="mt-3 flex-1 overflow-y-auto px-4">
++        {chatLog.length === 0 && <p className="text-center text-xs text-white/50">No messages yet — say hi</p>}
++        {chatLog.map((m, i) => (
++          <p key={i} className="mb-1.5 text-sm">
++            <span className="font-semibold">{m.author}</span> <span className="text-white/80">{m.text}</span>
++          </p>
++        ))}
++      </div>
++
++      <form onSubmit={handleSendChat} className="flex items-center gap-2 border-t border-white/10 px-4 py-3">
++        <input
++          value={chatText}
++          onChange={(e) => setChatText(e.target.value)}
++          placeholder="Say something…"
++          className="flex-1 rounded-full bg-white/10 px-4 py-2 text-sm text-white placeholder:text-white/50 focus-ring"
++        />
++        <button type="submit" className="rounded-full bg-saffron-500 p-2">
++          <Send className="h-4 w-4 text-navy-950" />
++        </button>
++      </form>
++    </div>
++  )
++}
+diff --git a/src/pages/Settings.jsx b/src/pages/Settings.jsx
+index 324350d..fc3edbc 100644
+--- a/src/pages/Settings.jsx
++++ b/src/pages/Settings.jsx
+@@ -168,13 +168,8 @@ export default function Settings() {
+           <Row
+             icon={Tag}
+             label="Topics & interests"
+-            sub="Chosen during onboarding"
+-            onClick={() =>
+-              comingSoon('Topics & interests', 'Update the topics you chose when you joined to fine-tune your feed.', [
+-                'Add or remove topics any time',
+-                'See less of topics you\u2019re not into',
+-              ])
+-            }
++            sub="Fine-tune your feed"
++            onClick={() => navigate('/settings/topics')}
+           />
+           <Row
+             icon={VolumeX}
+@@ -305,18 +300,10 @@ export default function Settings() {
+         </Group>
+ 
+         <Group emoji="📊" title="Your Insights">
+-          <Row icon={PieChart} label="Overview" onClick={() => comingSoon('Overview', 'Your activity and account performance at a glance.', [])} />
+-          <Row
+-            icon={TrendingUp}
+-            label="Content insights"
+-            onClick={() => comingSoon('Content insights', 'How your posts, videos and stories are performing.', [])}
+-          />
+-          <Row icon={Users} label="Audience" onClick={() => comingSoon('Audience', 'Audience growth, engagement and demographics.', [])} />
+-          <Row
+-            icon={Sparkles}
+-            label="Recommendations insights"
+-            onClick={() => comingSoon('Recommendations insights', 'Understand how your content is being discovered.', [])}
+-          />
++          <Row icon={PieChart} label="Overview" onClick={() => navigate('/settings/insights/overview')} />
++          <Row icon={TrendingUp} label="Content insights" onClick={() => navigate('/settings/insights/content')} />
++          <Row icon={Users} label="Audience" onClick={() => navigate('/settings/insights/audience')} />
++          <Row icon={Sparkles} label="Recommendations insights" onClick={() => navigate('/settings/insights/discovery')} />
+         </Group>
+ 
+         <Group emoji="🛠️" title="Tools & Support">
+@@ -341,16 +328,7 @@ export default function Settings() {
+             label="App & device"
+             onClick={() => comingSoon('App & device', 'App behavior, connected devices and device permissions.', [])}
+           />
+-          <Row
+-            icon={HelpCircle}
+-            label="Help & support"
+-            onClick={() =>
+-              comingSoon('Help & support', 'Help center, reporting a problem, and support requests.', [
+-                'Report a problem from any post via its ••• menu today',
+-                'A full help center is on the roadmap',
+-              ])
+-            }
+-          />
++          <Row icon={HelpCircle} label="Help & support" onClick={() => navigate('/settings/help')} />
+           <Row icon={Info} label="About" sub="Version, Privacy Policy, Terms" onClick={() => navigate('/settings/about')} />
+         </Group>
+       </div>
+diff --git a/src/pages/TopicsSettings.jsx b/src/pages/TopicsSettings.jsx
+new file mode 100644
+index 0000000..d977d1f
+--- /dev/null
++++ b/src/pages/TopicsSettings.jsx
+@@ -0,0 +1,78 @@
++import React, { useState } from 'react'
++import { useNavigate } from 'react-router-dom'
++import { Check } from 'lucide-react'
++import { TOPICS } from '../data/mockData.js'
++import { useApp } from '../context/AppContext.jsx'
++import PageHeader from '../components/PageHeader.jsx'
++
++// Settings -> Your Experience -> Topics & interests. Same TOPICS list and
++// grid pattern as onboarding's InterestSelection.jsx, but callable any
++// time via updateInterests (AppContext.jsx) instead of only once at
++// signup via completeOnboarding.
++const TONES = [
++  'from-saffron-400 to-saffron-600',
++  'from-navy-700 to-navy-950',
++  'from-emerald-400 to-bharat-green',
++  'from-blue-400 to-blue-700',
++  'from-purple-400 to-fuchsia-700',
++  'from-teal-400 to-cyan-700',
++  'from-amber-400 to-orange-600',
++  'from-lime-400 to-green-700',
++  'from-rose-400 to-red-700',
++]
++
++export default function TopicsSettings() {
++  const navigate = useNavigate()
++  const { currentUser, updateInterests, pushToast } = useApp()
++  const [selected, setSelected] = useState(() => TOPICS.filter((t) => currentUser.topics?.includes(t.id)).map((t) => t.id))
++
++  const toggle = (id) => {
++    setSelected((prev) => (prev.includes(id) ? prev.filter((t) => t !== id) : [...prev, id]))
++  }
++
++  const handleSave = () => {
++    updateInterests(selected)
++    pushToast('Topics updated')
++    navigate(-1)
++  }
++
++  return (
++    <div>
++      <PageHeader title="Topics & interests" showBack />
++      <div className="p-4">
++        <p className="mb-4 text-sm text-ink-500">Add or remove topics any time to fine-tune your feed.</p>
++        <div className="grid grid-cols-3 gap-3">
++          {TOPICS.map((topic, i) => {
++            const isSelected = selected.includes(topic.id)
++            return (
++              <button
++                key={topic.id}
++                onClick={() => toggle(topic.id)}
++                className={`focus-ring relative flex aspect-square flex-col items-center justify-center gap-1.5 rounded-2xl bg-gradient-to-br text-white transition-transform active:scale-95 ${TONES[i % TONES.length]} ${
++                  isSelected ? 'ring-[3px] ring-saffron-500 ring-offset-2' : ''
++                }`}
++              >
++                <span
++                  className={`absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded-full border-2 border-white/80 ${
++                    isSelected ? 'bg-white' : 'bg-white/10'
++                  }`}
++                >
++                  {isSelected && <Check className="h-3.5 w-3.5 text-saffron-600" strokeWidth={3} />}
++                </span>
++                <span className="text-2xl">{topic.emoji}</span>
++                <span className="px-1 text-center text-[11px] font-semibold leading-tight">{topic.label}</span>
++              </button>
++            )
++          })}
++        </div>
++
++        <button
++          onClick={handleSave}
++          className="mt-6 flex w-full items-center justify-center gap-2 rounded-full bg-saffron-gradient px-6 py-3.5 font-display text-[15px] font-bold text-navy-950 shadow-pop transition-transform active:scale-[0.98]"
++        >
++          Save
++        </button>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/utils/live.js b/src/utils/live.js
+index 3d5ee93..444f76f 100644
+--- a/src/utils/live.js
++++ b/src/utils/live.js
+@@ -91,6 +91,7 @@ export function mapProfileToUser(userId, profile) {
+     posts: profile?.postCount ?? 0,
+     topics: profile?.interests || [],
+     avatarUrl: profile?.avatarUrl || null,
++    accountType: profile?.accountType || 'user',
+   }
+ }
+ 

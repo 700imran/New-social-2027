@@ -168,13 +168,8 @@ export default function Settings() {
           <Row
             icon={Tag}
             label="Topics & interests"
-            sub="Chosen during onboarding"
-            onClick={() =>
-              comingSoon('Topics & interests', 'Update the topics you chose when you joined to fine-tune your feed.', [
-                'Add or remove topics any time',
-                'See less of topics you\u2019re not into',
-              ])
-            }
+            sub="Fine-tune your feed"
+            onClick={() => navigate('/settings/topics')}
           />
           <Row
             icon={VolumeX}
@@ -305,18 +300,10 @@ export default function Settings() {
         </Group>
 
         <Group emoji="📊" title="Your Insights">
-          <Row icon={PieChart} label="Overview" onClick={() => comingSoon('Overview', 'Your activity and account performance at a glance.', [])} />
-          <Row
-            icon={TrendingUp}
-            label="Content insights"
-            onClick={() => comingSoon('Content insights', 'How your posts, videos and stories are performing.', [])}
-          />
-          <Row icon={Users} label="Audience" onClick={() => comingSoon('Audience', 'Audience growth, engagement and demographics.', [])} />
-          <Row
-            icon={Sparkles}
-            label="Recommendations insights"
-            onClick={() => comingSoon('Recommendations insights', 'Understand how your content is being discovered.', [])}
-          />
+          <Row icon={PieChart} label="Overview" onClick={() => navigate('/settings/insights/overview')} />
+          <Row icon={TrendingUp} label="Content insights" onClick={() => navigate('/settings/insights/content')} />
+          <Row icon={Users} label="Audience" onClick={() => navigate('/settings/insights/audience')} />
+          <Row icon={Sparkles} label="Recommendations insights" onClick={() => navigate('/settings/insights/discovery')} />
         </Group>
 
         <Group emoji="🛠️" title="Tools & Support">
@@ -341,16 +328,7 @@ export default function Settings() {
             label="App & device"
             onClick={() => comingSoon('App & device', 'App behavior, connected devices and device permissions.', [])}
           />
-          <Row
-            icon={HelpCircle}
-            label="Help & support"
-            onClick={() =>
-              comingSoon('Help & support', 'Help center, reporting a problem, and support requests.', [
-                'Report a problem from any post via its ••• menu today',
-                'A full help center is on the roadmap',
-              ])
-            }
-          />
+          <Row icon={HelpCircle} label="Help & support" onClick={() => navigate('/settings/help')} />
           <Row icon={Info} label="About" sub="Version, Privacy Policy, Terms" onClick={() => navigate('/settings/about')} />
         </Group>
       </div>

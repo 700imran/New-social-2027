@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Send, Trash2 } from 'lucide-react'
+import { Send, Trash2, Phone, Video } from 'lucide-react'
 import PageHeader from '../components/PageHeader.jsx'
 import Avatar from '../components/Avatar.jsx'
 import { useApp } from '../context/AppContext.jsx'
@@ -138,6 +138,26 @@ export default function ChatThread() {
           </button>
         }
         showBack
+        right={
+          conversation && (
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => otherUser && navigate(`/call/${conversation.id}/audio?peer=${otherUser.id}`)}
+                className="focus-ring rounded-full p-2 text-ink-700 transition-transform active:scale-90"
+                aria-label="Audio call"
+              >
+                <Phone className="h-5 w-5" />
+              </button>
+              <button
+                onClick={() => otherUser && navigate(`/call/${conversation.id}/video?peer=${otherUser.id}`)}
+                className="focus-ring rounded-full p-2 text-ink-700 transition-transform active:scale-90"
+                aria-label="Video call"
+              >
+                <Video className="h-5 w-5" />
+              </button>
+            </div>
+          )
+        }
       />
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">

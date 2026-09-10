@@ -2,11 +2,20 @@ import React from 'react'
 import { Navigate, Outlet } from 'react-router-dom'
 import { WifiOff } from 'lucide-react'
 import { useApp } from '../context/AppContext.jsx'
+import { useKeyboardInset } from '../utils/useKeyboardInset.js'
 import BottomNav from './BottomNav.jsx'
 import ToastStack from './ToastStack.jsx'
 
 export default function AppLayout() {
   const { isAuthenticated, isOffline } = useApp()
+  // Global, not per-page: any open keyboard (chat, comments, search, a
+  // caption field) hides BottomNav entirely rather than leaving it to
+  // sit underneath — and drops the pb-20 space reserved for it, so the
+  // page below gets that room back instead of an empty gap sitting
+  // above the keyboard. See useKeyboardInset.js for why this is a
+  // measured value, not a guessed constant.
+  const keyboardInset = useKeyboardInset()
+  const keyboardOpen = keyboardInset > 0
 
   if (!isAuthenticated) {
     return <Navigate to="/signin" replace />
@@ -19,10 +28,10 @@ export default function AppLayout() {
           <WifiOff className="h-3 w-3" /> You're offline — showing saved content
         </div>
       )}
-      <div className="flex-1 pb-20">
+      <div className={`flex-1 ${keyboardOpen ? '' : 'pb-20'}`}>
         <Outlet />
       </div>
-      <BottomNav />
+      {!keyboardOpen && <BottomNav />}
       <ToastStack />
     </div>
   )

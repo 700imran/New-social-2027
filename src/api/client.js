@@ -16,6 +16,8 @@
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || null
 export const isLive = Boolean(BASE_URL)
 
+import { setRealtimeAuth } from './realtime.js'
+
 // Access token only — kept in memory (a module-level variable), never in
 // localStorage/sessionStorage. The refresh token never touches JS at all;
 // it lives in an httpOnly cookie the backend sets (see routes/auth.js),
@@ -25,6 +27,10 @@ export const isLive = Boolean(BASE_URL)
 let accessToken = null
 export function setAccessToken(token) {
   accessToken = token
+  // Keeps the optional Realtime layer's socket auth current too — see
+  // api/realtime.js. A no-op there when VITE_SUPABASE_URL/ANON_KEY
+  // aren't set, so this is safe to call unconditionally.
+  setRealtimeAuth(token)
 }
 
 // Thrown only when fetch() itself fails to reach the server at all (no
@@ -157,6 +163,16 @@ export async function updatePasswordWithToken(oneOffToken, password) {
 
 export const getProfile = (userId) => request(`/profiles/${userId}`, { auth: false })
 export const updateProfile = (userId, updates) => request(`/profiles/${userId}`, { method: 'PATCH', body: updates })
+export const updateAccountType = (accountType) => request('/account/type', { method: 'PATCH', body: { accountType } })
+export const getActiveLiveStreams = () => request('/live/active', { auth: false })
+export const startLiveStream = (title) => request('/live/start', { method: 'POST', body: { title } })
+export const endLiveStream = (id) => request(`/live/${id}/end`, { method: 'PATCH' })
+export const getInsightsOverview = () => request('/insights/overview')
+export const getInsightsContent = () => request('/insights/content')
+export const getInsightsAudience = () => request('/insights/audience')
+export const getInsightsDiscovery = () => request('/insights/discovery')
+export const getSupportTickets = () => request('/support/tickets')
+export const createSupportTicket = (subject, body) => request('/support/tickets', { method: 'POST', body: { subject, body } })
 export const follow = (followeeId) => request('/follows', { method: 'POST', body: { followeeId } })
 export const unfollow = (followeeId) => request(`/follows/${followeeId}`, { method: 'DELETE' })
 export const getFollowers = (userId) => request(`/users/${userId}/followers`, { auth: false })
