@@ -112,6 +112,7 @@ export function AppProvider({ children }) {
   // migrations/008_muted_creators.sql) — you keep following them if you
   // did, and nothing changes on their end.
   const [mutedUserIds, setMutedUserIds] = useState(new Set())
+  const [closeFriendIds, setCloseFriendIds] = useState(new Set())
   const [hiddenPostIds, setHiddenPostIds] = useState(new Set())
   // Direct messages. Deliberately NOT fetched from the auth bootstrap
   // effect below (unlike posts/notifications/saved/etc.) — Home.jsx's own
@@ -137,8 +138,12 @@ export function AppProvider({ children }) {
     },
     privacy: { isPrivate: false, whoCanMessage: 'everyone', whoCanComment: 'everyone', sensitiveContentFilter: 'standard' },
     appearance: { theme: 'system', language: 'en', textSize: 'medium' },
-    focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null },
+    focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null, dailyReminderMinutes: null },
     muted_words: [],
+    accessibility: { reduceMotion: false, highContrast: false, captionsDefaultOn: false },
+    ads_preferences: { personalizedAds: true, topics: [] },
+    data_usage: { dataSaver: false, autoPlayVideos: 'wifi' },
+    feed_preferences: { prioritizeFollowing: false },
   })
   // Comment likes (see migrations/009_comment_mini_controls.sql) — a
   // comment id is unique across the whole app, same reasoning as
@@ -519,6 +524,16 @@ export function AppProvider({ children }) {
     }
   }, [])
 
+  const fetchCloseFriendsLive = useCallback(async () => {
+    if (!isLive) return
+    try {
+      const ids = await api.getCloseFriends()
+      setCloseFriendIds(new Set(ids))
+    } catch {
+      /* not fatal — same reasoning as fetchBlocksLive above */
+    }
+  }, [])
+
   // Rehydrates userSettings from GET /v1/settings on load — same
   // reasoning as fetchBlocksLive/fetchMutesLive: without this, a page
   // refresh would silently reset every toggle on the Settings screens
@@ -556,6 +571,7 @@ export function AppProvider({ children }) {
         fetchHiddenPostsLive(),
         fetchBlocksLive(),
         fetchMutesLive(),
+        fetchCloseFriendsLive(),
         fetchSettingsLive(),
       ])
     },
@@ -567,6 +583,7 @@ export function AppProvider({ children }) {
       fetchHiddenPostsLive,
       fetchBlocksLive,
       fetchMutesLive,
+      fetchCloseFriendsLive,
       fetchSettingsLive,
     ]
   )
@@ -575,6 +592,7 @@ export function AppProvider({ children }) {
     async (credentials) => {
       const session = await api.signIn(credentials)
       api.setAccessToken(session.accessToken)
+      api.logSession().catch(() => {}) // best-effort — see docs/migrations/020_login_events.sql
       try {
         await hydrateSession(session.userId)
       } catch (hydrateErr) {
@@ -1236,6 +1254,24 @@ export function AppProvider({ children }) {
     [pushToast]
   )
 
+  // Settings -> Your Experience -> Feed & recommendations -> "Reset
+  // recommendations". Clears the real, already-working hidden_posts list
+  // (007_hidden_posts.sql) — "see fewer posts like this" and "reset
+  // recommendations" are the same mechanism from opposite directions,
+  // not two separate systems.
+  const resetFeedRecommendations = useCallback(() => {
+    const ids = [...hiddenPostIds]
+    if (ids.length === 0) {
+      pushToast('Nothing to reset — your feed has no hidden posts')
+      return
+    }
+    setHiddenPostIds(new Set())
+    pushToast(`Unhid ${ids.length} post${ids.length === 1 ? '' : 's'} — your feed will reflect this now`)
+    if (isLive) {
+      ids.forEach((id) => api.unhidePost(id).catch(() => {}))
+    }
+  }, [hiddenPostIds, pushToast])
+
   const toggleBlock = useCallback(
     (userId) => {
       setBlockedUserIds((prev) => {
@@ -1287,6 +1323,41 @@ export function AppProvider({ children }) {
             setMutedUserIds((p2) => {
               const n2 = new Set(p2)
               if (wasMuted) n2.add(userId)
+              else n2.delete(userId)
+              return n2
+            })
+            pushToast('Could not update — please try again')
+          })
+        }
+
+        return next
+      })
+    },
+    [getUser, pushToast]
+  )
+
+  // Close Friends (see docs/migrations/018_close_friends.sql) — a private
+  // list only its owner can see or manage, same visibility model as
+  // mutes/blocks above. Nothing yet reads this list to change who a post
+  // is shared with (no "close friends only" audience option in
+  // CreatePost.jsx) — see that migration's comment for the honest scope.
+  const toggleCloseFriend = useCallback(
+    (userId) => {
+      setCloseFriendIds((prev) => {
+        const next = new Set(prev)
+        const wasFriend = next.has(userId)
+        if (wasFriend) next.delete(userId)
+        else next.add(userId)
+
+        const name = getUser(userId)?.name ?? 'this user'
+        pushToast(wasFriend ? `Removed ${name} from Close Friends` : `Added ${name} to Close Friends`)
+
+        if (isLive) {
+          const action = wasFriend ? api.removeCloseFriend(userId) : api.addCloseFriend(userId)
+          action.catch(() => {
+            setCloseFriendIds((p2) => {
+              const n2 = new Set(p2)
+              if (wasFriend) n2.add(userId)
               else n2.delete(userId)
               return n2
             })
@@ -1646,10 +1717,13 @@ export function AppProvider({ children }) {
     savedPostIds,
     hiddenPostIds,
     hidePost,
+    resetFeedRecommendations,
     blockedUserIds,
     toggleBlock,
     mutedUserIds,
     toggleMute,
+    closeFriendIds,
+    toggleCloseFriend,
     likedCommentIds,
     toggleCommentLike,
     deleteComment,

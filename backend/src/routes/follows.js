@@ -167,4 +167,45 @@ follows.get('/mutes', requireAuth, async (c) => {
   return c.json(data.map((row) => row.muted_user_id))
 })
 
+// POST /v1/close-friends  { friendId } — add someone to your Close
+// Friends list (see docs/migrations/018_close_friends.sql). Purely a
+// list today: nothing yet reads it to change who a post is shared with
+// (CreatePost.jsx has no "close friends only" audience option), same
+// honest scope note as that migration's own comment.
+follows.post('/close-friends', requireAuth, async (c) => {
+  const rate = await checkRateLimit(c.env, 'WRITE_RATE_LIMITER', c.get('userId'))
+  if (!rate.allowed) return c.json({ error: 'Please slow down.' }, 429)
+
+  const { friendId } = await c.req.json().catch(() => ({}))
+  if (!friendId) return c.json({ error: 'friendId is required' }, 400)
+  if (friendId === c.get('userId')) return c.json({ error: "You can't add yourself" }, 400)
+
+  const supabase = userClient(c.env, c.get('jwt'))
+  const { error } = await supabase
+    .from('close_friends')
+    .upsert({ user_id: c.get('userId'), friend_id: friendId }, { onConflict: 'user_id,friend_id' })
+  if (error) return dbError(c, error)
+  return c.json({ ok: true }, 201)
+})
+
+// DELETE /v1/close-friends/:friendId — remove
+follows.delete('/close-friends/:friendId', requireAuth, async (c) => {
+  const supabase = userClient(c.env, c.get('jwt'))
+  const { error } = await supabase
+    .from('close_friends')
+    .delete()
+    .eq('user_id', c.get('userId'))
+    .eq('friend_id', c.req.param('friendId'))
+  if (error) return dbError(c, error)
+  return c.json({ ok: true })
+})
+
+// GET /v1/close-friends — id list, same shape as GET /mutes above.
+follows.get('/close-friends', requireAuth, async (c) => {
+  const supabase = userClient(c.env, c.get('jwt'))
+  const { data, error } = await supabase.from('close_friends').select('friend_id').eq('user_id', c.get('userId'))
+  if (error) return dbError(c, error)
+  return c.json(data.map((row) => row.friend_id))
+})
+
 export default follows

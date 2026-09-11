@@ -40,6 +40,13 @@ const InsightsContent = lazy(() => import('./pages/InsightsContent.jsx'))
 const InsightsAudience = lazy(() => import('./pages/InsightsAudience.jsx'))
 const InsightsDiscovery = lazy(() => import('./pages/InsightsDiscovery.jsx'))
 const HelpSupport = lazy(() => import('./pages/HelpSupport.jsx'))
+const Accessibility = lazy(() => import('./pages/Accessibility.jsx'))
+const AdsPreferences = lazy(() => import('./pages/AdsPreferences.jsx'))
+const CloseFriends = lazy(() => import('./pages/CloseFriends.jsx'))
+const DataUsage = lazy(() => import('./pages/DataUsage.jsx'))
+const LoginActivity = lazy(() => import('./pages/LoginActivity.jsx'))
+const TimeManagement = lazy(() => import('./pages/TimeManagement.jsx'))
+const FeedPreferences = lazy(() => import('./pages/FeedPreferences.jsx'))
 const ManagedAccounts = lazy(() => import('./pages/ManagedAccounts.jsx'))
 const AboutApp = lazy(() => import('./pages/AboutApp.jsx'))
 const NotificationSettings = lazy(() => import('./pages/NotificationSettings.jsx'))
@@ -173,6 +180,13 @@ export default function App() {
           <Route path="/settings/insights/audience" element={<InsightsAudience />} />
           <Route path="/settings/insights/discovery" element={<InsightsDiscovery />} />
           <Route path="/settings/help" element={<HelpSupport />} />
+          <Route path="/settings/accessibility" element={<Accessibility />} />
+          <Route path="/settings/ads" element={<AdsPreferences />} />
+          <Route path="/settings/close-friends" element={<CloseFriends />} />
+          <Route path="/settings/data-usage" element={<DataUsage />} />
+          <Route path="/settings/login-activity" element={<LoginActivity />} />
+          <Route path="/settings/time" element={<TimeManagement />} />
+          <Route path="/settings/feed" element={<FeedPreferences />} />
           <Route path="/settings/blocked" element={<ManagedAccounts type="blocked" />} />
           <Route path="/settings/muted" element={<ManagedAccounts type="muted" />} />
           <Route path="/settings/about" element={<AboutApp />} />

@@ -25,8 +25,12 @@ const DEFAULTS = {
     sensitiveContentFilter: 'standard',
   },
   appearance: { theme: 'system', language: 'en', textSize: 'medium' },
-  focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null },
+  focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null, dailyReminderMinutes: null },
   muted_words: [],
+  accessibility: { reduceMotion: false, highContrast: false, captionsDefaultOn: false },
+  ads_preferences: { personalizedAds: true, topics: [] },
+  data_usage: { dataSaver: false, autoPlayVideos: 'wifi' },
+  feed_preferences: { prioritizeFollowing: false },
 }
 
 const NOTIFICATION_CATEGORIES = ['likes', 'comments', 'follows', 'mentions', 'messages']
@@ -48,6 +52,10 @@ function shape(row) {
     appearance: { ...DEFAULTS.appearance, ...(row?.appearance || {}) },
     focus: { ...DEFAULTS.focus, ...(row?.focus || {}) },
     muted_words: Array.isArray(row?.muted_words) ? row.muted_words : [],
+    accessibility: { ...DEFAULTS.accessibility, ...(row?.accessibility || {}) },
+    ads_preferences: { ...DEFAULTS.ads_preferences, ...(row?.ads_preferences || {}) },
+    data_usage: { ...DEFAULTS.data_usage, ...(row?.data_usage || {}) },
+    feed_preferences: { ...DEFAULTS.feed_preferences, ...(row?.feed_preferences || {}) },
   }
 }
 
@@ -182,6 +190,13 @@ settings.patch('/settings', requireAuth, async (c) => {
         f[key] = body.focus[key]
       }
     }
+    if (body.focus.dailyReminderMinutes !== undefined) {
+      const v = body.focus.dailyReminderMinutes
+      if (v !== null && (!Number.isInteger(v) || v < 5 || v > 600)) {
+        return c.json({ error: 'focus.dailyReminderMinutes must be null or an integer between 5 and 600' }, 400)
+      }
+      f.dailyReminderMinutes = v
+    }
     next.focus = f
   }
 
@@ -197,6 +212,73 @@ settings.patch('/settings', requireAuth, async (c) => {
       cleaned.push(w.trim().toLowerCase())
     }
     next.muted_words = [...new Set(cleaned)]
+  }
+
+  if (body.accessibility !== undefined) {
+    if (typeof body.accessibility !== 'object' || body.accessibility === null) {
+      return c.json({ error: 'accessibility must be an object' }, 400)
+    }
+    const a = { ...current.accessibility }
+    for (const key of ['reduceMotion', 'highContrast', 'captionsDefaultOn']) {
+      if (body.accessibility[key] !== undefined) {
+        if (typeof body.accessibility[key] !== 'boolean') return c.json({ error: `accessibility.${key} must be true or false` }, 400)
+        a[key] = body.accessibility[key]
+      }
+    }
+    next.accessibility = a
+  }
+
+  if (body.ads_preferences !== undefined) {
+    if (typeof body.ads_preferences !== 'object' || body.ads_preferences === null) {
+      return c.json({ error: 'ads_preferences must be an object' }, 400)
+    }
+    const ad = { ...current.ads_preferences }
+    if (body.ads_preferences.personalizedAds !== undefined) {
+      if (typeof body.ads_preferences.personalizedAds !== 'boolean') {
+        return c.json({ error: 'ads_preferences.personalizedAds must be true or false' }, 400)
+      }
+      ad.personalizedAds = body.ads_preferences.personalizedAds
+    }
+    if (body.ads_preferences.topics !== undefined) {
+      if (!Array.isArray(body.ads_preferences.topics) || body.ads_preferences.topics.some((t) => typeof t !== 'string')) {
+        return c.json({ error: 'ads_preferences.topics must be a list of strings' }, 400)
+      }
+      ad.topics = [...new Set(body.ads_preferences.topics)]
+    }
+    next.ads_preferences = ad
+  }
+
+  const AUTOPLAY_MODES = ['always', 'wifi', 'never']
+  if (body.data_usage !== undefined) {
+    if (typeof body.data_usage !== 'object' || body.data_usage === null) {
+      return c.json({ error: 'data_usage must be an object' }, 400)
+    }
+    const d = { ...current.data_usage }
+    if (body.data_usage.dataSaver !== undefined) {
+      if (typeof body.data_usage.dataSaver !== 'boolean') return c.json({ error: 'data_usage.dataSaver must be true or false' }, 400)
+      d.dataSaver = body.data_usage.dataSaver
+    }
+    if (body.data_usage.autoPlayVideos !== undefined) {
+      if (!AUTOPLAY_MODES.includes(body.data_usage.autoPlayVideos)) {
+        return c.json({ error: `data_usage.autoPlayVideos must be one of ${AUTOPLAY_MODES.join(', ')}` }, 400)
+      }
+      d.autoPlayVideos = body.data_usage.autoPlayVideos
+    }
+    next.data_usage = d
+  }
+
+  if (body.feed_preferences !== undefined) {
+    if (typeof body.feed_preferences !== 'object' || body.feed_preferences === null) {
+      return c.json({ error: 'feed_preferences must be an object' }, 400)
+    }
+    const fp = { ...current.feed_preferences }
+    if (body.feed_preferences.prioritizeFollowing !== undefined) {
+      if (typeof body.feed_preferences.prioritizeFollowing !== 'boolean') {
+        return c.json({ error: 'feed_preferences.prioritizeFollowing must be true or false' }, 400)
+      }
+      fp.prioritizeFollowing = body.feed_preferences.prioritizeFollowing
+    }
+    next.feed_preferences = fp
   }
 
   const { data, error } = await supabase

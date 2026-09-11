@@ -47,6 +47,32 @@ account.patch('/account/type', requireAuth, async (c) => {
   return c.json({ accountType: body.accountType })
 })
 
+// POST /v1/account/sessions — logs "a session started" for Settings ->
+// Account protection / App & device's login-activity list. Called from
+// the frontend right after sign-in succeeds (see docs/migrations/020's
+// comment on why this isn't in auth.js's login handler instead).
+account.post('/account/sessions', requireAuth, async (c) => {
+  const supabase = userClient(c.env, c.get('jwt'))
+  const { error } = await supabase
+    .from('login_events')
+    .insert({ user_id: c.get('userId'), user_agent: c.req.header('User-Agent') || null })
+  if (error) return c.json({ error: 'Could not log this session' }, 500)
+  return c.json({ ok: true }, 201)
+})
+
+// GET /v1/account/sessions — most recent first, capped at 20.
+account.get('/account/sessions', requireAuth, async (c) => {
+  const supabase = userClient(c.env, c.get('jwt'))
+  const { data, error } = await supabase
+    .from('login_events')
+    .select('id, user_agent, created_at')
+    .eq('user_id', c.get('userId'))
+    .order('created_at', { ascending: false })
+    .limit(20)
+  if (error) return c.json({ error: 'Could not load your login activity' }, 500)
+  return c.json({ sessions: data || [] })
+})
+
 // DELETE /v1/account
 //
 // Permanently deletes the caller's account and everything referencing it.

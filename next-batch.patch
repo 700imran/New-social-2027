@@ -1,0 +1,1327 @@
+diff --git a/backend/src/routes/account.js b/backend/src/routes/account.js
+index 88e3971..56abf51 100644
+--- a/backend/src/routes/account.js
++++ b/backend/src/routes/account.js
+@@ -47,6 +47,32 @@ account.patch('/account/type', requireAuth, async (c) => {
+   return c.json({ accountType: body.accountType })
+ })
+ 
++// POST /v1/account/sessions — logs "a session started" for Settings ->
++// Account protection / App & device's login-activity list. Called from
++// the frontend right after sign-in succeeds (see docs/migrations/020's
++// comment on why this isn't in auth.js's login handler instead).
++account.post('/account/sessions', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { error } = await supabase
++    .from('login_events')
++    .insert({ user_id: c.get('userId'), user_agent: c.req.header('User-Agent') || null })
++  if (error) return c.json({ error: 'Could not log this session' }, 500)
++  return c.json({ ok: true }, 201)
++})
++
++// GET /v1/account/sessions — most recent first, capped at 20.
++account.get('/account/sessions', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { data, error } = await supabase
++    .from('login_events')
++    .select('id, user_agent, created_at')
++    .eq('user_id', c.get('userId'))
++    .order('created_at', { ascending: false })
++    .limit(20)
++  if (error) return c.json({ error: 'Could not load your login activity' }, 500)
++  return c.json({ sessions: data || [] })
++})
++
+ // DELETE /v1/account
+ //
+ // Permanently deletes the caller's account and everything referencing it.
+diff --git a/backend/src/routes/follows.js b/backend/src/routes/follows.js
+index e36ed47..6c3c55d 100644
+--- a/backend/src/routes/follows.js
++++ b/backend/src/routes/follows.js
+@@ -167,4 +167,45 @@ follows.get('/mutes', requireAuth, async (c) => {
+   return c.json(data.map((row) => row.muted_user_id))
+ })
+ 
++// POST /v1/close-friends  { friendId } — add someone to your Close
++// Friends list (see docs/migrations/018_close_friends.sql). Purely a
++// list today: nothing yet reads it to change who a post is shared with
++// (CreatePost.jsx has no "close friends only" audience option), same
++// honest scope note as that migration's own comment.
++follows.post('/close-friends', requireAuth, async (c) => {
++  const rate = await checkRateLimit(c.env, 'WRITE_RATE_LIMITER', c.get('userId'))
++  if (!rate.allowed) return c.json({ error: 'Please slow down.' }, 429)
++
++  const { friendId } = await c.req.json().catch(() => ({}))
++  if (!friendId) return c.json({ error: 'friendId is required' }, 400)
++  if (friendId === c.get('userId')) return c.json({ error: "You can't add yourself" }, 400)
++
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { error } = await supabase
++    .from('close_friends')
++    .upsert({ user_id: c.get('userId'), friend_id: friendId }, { onConflict: 'user_id,friend_id' })
++  if (error) return dbError(c, error)
++  return c.json({ ok: true }, 201)
++})
++
++// DELETE /v1/close-friends/:friendId — remove
++follows.delete('/close-friends/:friendId', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { error } = await supabase
++    .from('close_friends')
++    .delete()
++    .eq('user_id', c.get('userId'))
++    .eq('friend_id', c.req.param('friendId'))
++  if (error) return dbError(c, error)
++  return c.json({ ok: true })
++})
++
++// GET /v1/close-friends — id list, same shape as GET /mutes above.
++follows.get('/close-friends', requireAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { data, error } = await supabase.from('close_friends').select('friend_id').eq('user_id', c.get('userId'))
++  if (error) return dbError(c, error)
++  return c.json(data.map((row) => row.friend_id))
++})
++
+ export default follows
+diff --git a/backend/src/routes/settings.js b/backend/src/routes/settings.js
+index fbdf99a..c245ac5 100644
+--- a/backend/src/routes/settings.js
++++ b/backend/src/routes/settings.js
+@@ -25,8 +25,12 @@ const DEFAULTS = {
+     sensitiveContentFilter: 'standard',
+   },
+   appearance: { theme: 'system', language: 'en', textSize: 'medium' },
+-  focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null },
++  focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null, dailyReminderMinutes: null },
+   muted_words: [],
++  accessibility: { reduceMotion: false, highContrast: false, captionsDefaultOn: false },
++  ads_preferences: { personalizedAds: true, topics: [] },
++  data_usage: { dataSaver: false, autoPlayVideos: 'wifi' },
++  feed_preferences: { prioritizeFollowing: false },
+ }
+ 
+ const NOTIFICATION_CATEGORIES = ['likes', 'comments', 'follows', 'mentions', 'messages']
+@@ -48,6 +52,10 @@ function shape(row) {
+     appearance: { ...DEFAULTS.appearance, ...(row?.appearance || {}) },
+     focus: { ...DEFAULTS.focus, ...(row?.focus || {}) },
+     muted_words: Array.isArray(row?.muted_words) ? row.muted_words : [],
++    accessibility: { ...DEFAULTS.accessibility, ...(row?.accessibility || {}) },
++    ads_preferences: { ...DEFAULTS.ads_preferences, ...(row?.ads_preferences || {}) },
++    data_usage: { ...DEFAULTS.data_usage, ...(row?.data_usage || {}) },
++    feed_preferences: { ...DEFAULTS.feed_preferences, ...(row?.feed_preferences || {}) },
+   }
+ }
+ 
+@@ -182,6 +190,13 @@ settings.patch('/settings', requireAuth, async (c) => {
+         f[key] = body.focus[key]
+       }
+     }
++    if (body.focus.dailyReminderMinutes !== undefined) {
++      const v = body.focus.dailyReminderMinutes
++      if (v !== null && (!Number.isInteger(v) || v < 5 || v > 600)) {
++        return c.json({ error: 'focus.dailyReminderMinutes must be null or an integer between 5 and 600' }, 400)
++      }
++      f.dailyReminderMinutes = v
++    }
+     next.focus = f
+   }
+ 
+@@ -199,6 +214,73 @@ settings.patch('/settings', requireAuth, async (c) => {
+     next.muted_words = [...new Set(cleaned)]
+   }
+ 
++  if (body.accessibility !== undefined) {
++    if (typeof body.accessibility !== 'object' || body.accessibility === null) {
++      return c.json({ error: 'accessibility must be an object' }, 400)
++    }
++    const a = { ...current.accessibility }
++    for (const key of ['reduceMotion', 'highContrast', 'captionsDefaultOn']) {
++      if (body.accessibility[key] !== undefined) {
++        if (typeof body.accessibility[key] !== 'boolean') return c.json({ error: `accessibility.${key} must be true or false` }, 400)
++        a[key] = body.accessibility[key]
++      }
++    }
++    next.accessibility = a
++  }
++
++  if (body.ads_preferences !== undefined) {
++    if (typeof body.ads_preferences !== 'object' || body.ads_preferences === null) {
++      return c.json({ error: 'ads_preferences must be an object' }, 400)
++    }
++    const ad = { ...current.ads_preferences }
++    if (body.ads_preferences.personalizedAds !== undefined) {
++      if (typeof body.ads_preferences.personalizedAds !== 'boolean') {
++        return c.json({ error: 'ads_preferences.personalizedAds must be true or false' }, 400)
++      }
++      ad.personalizedAds = body.ads_preferences.personalizedAds
++    }
++    if (body.ads_preferences.topics !== undefined) {
++      if (!Array.isArray(body.ads_preferences.topics) || body.ads_preferences.topics.some((t) => typeof t !== 'string')) {
++        return c.json({ error: 'ads_preferences.topics must be a list of strings' }, 400)
++      }
++      ad.topics = [...new Set(body.ads_preferences.topics)]
++    }
++    next.ads_preferences = ad
++  }
++
++  const AUTOPLAY_MODES = ['always', 'wifi', 'never']
++  if (body.data_usage !== undefined) {
++    if (typeof body.data_usage !== 'object' || body.data_usage === null) {
++      return c.json({ error: 'data_usage must be an object' }, 400)
++    }
++    const d = { ...current.data_usage }
++    if (body.data_usage.dataSaver !== undefined) {
++      if (typeof body.data_usage.dataSaver !== 'boolean') return c.json({ error: 'data_usage.dataSaver must be true or false' }, 400)
++      d.dataSaver = body.data_usage.dataSaver
++    }
++    if (body.data_usage.autoPlayVideos !== undefined) {
++      if (!AUTOPLAY_MODES.includes(body.data_usage.autoPlayVideos)) {
++        return c.json({ error: `data_usage.autoPlayVideos must be one of ${AUTOPLAY_MODES.join(', ')}` }, 400)
++      }
++      d.autoPlayVideos = body.data_usage.autoPlayVideos
++    }
++    next.data_usage = d
++  }
++
++  if (body.feed_preferences !== undefined) {
++    if (typeof body.feed_preferences !== 'object' || body.feed_preferences === null) {
++      return c.json({ error: 'feed_preferences must be an object' }, 400)
++    }
++    const fp = { ...current.feed_preferences }
++    if (body.feed_preferences.prioritizeFollowing !== undefined) {
++      if (typeof body.feed_preferences.prioritizeFollowing !== 'boolean') {
++        return c.json({ error: 'feed_preferences.prioritizeFollowing must be true or false' }, 400)
++      }
++      fp.prioritizeFollowing = body.feed_preferences.prioritizeFollowing
++    }
++    next.feed_preferences = fp
++  }
++
+   const { data, error } = await supabase
+     .from('user_settings')
+     .upsert({ user_id: userId, ...next, updated_at: new Date().toISOString() })
+diff --git a/docs/PROGRESS.md b/docs/PROGRESS.md
+new file mode 100644
+index 0000000..18a7ddb
+--- /dev/null
++++ b/docs/PROGRESS.md
+@@ -0,0 +1,84 @@
++# Progress & next steps
++
++Living record of what's been built, what's left, and what needs a decision
++from you specifically (not something that can be coded around). Update
++this file as things move, don't let it go stale — a wrong status here is
++worse than no doc at all.
++
++## Setup you still need to do (config, not code)
++
++1. **Run migrations 013–021** (`docs/migrations/`) against your Supabase
++   project, in order, if you haven't already. Each file's own comment
++   says exactly what it does and why.
++2. **Confirmation email isn't sending** because two Cloudflare Worker
++   secrets aren't set yet — the code path is already correct (verified by
++   reading the current `auth.js`/`email.js` directly):
++   - `wrangler secret put RESEND_API_KEY`
++   - `wrangler secret put EMAIL_FROM_ADDRESS` (must be on a Resend-verified sending domain)
++   - `FRONTEND_URL` is already set correctly in `wrangler.toml` — nothing
++     to do there.
++   - Redeploy after adding secrets — they don't apply to an already-running Worker.
++   - Separately: Supabase dashboard → Authentication → Providers → Email
++     → "Confirm email" controls whether `signInWithPassword` actually
++     blocks an unconfirmed user. That's independent of the sending pipeline above.
++3. **Realtime** (`docs/migrations/013_enable_realtime.sql`) needs
++   `messages` and `user_settings` added to the `supabase_realtime`
++   publication — that migration does it via SQL, or toggle it in
++   Database → Replication if you'd rather.
++
++## Done and verified (builds clean, backend syntax-checked)
++
++- **Bottom-anchoring / keyboard behavior** — Chat, Comments, Reels
++  comment/share, Share sheet, New-message picker: all keyboard-aware via
++  `src/utils/useKeyboardInset.js`, no hardcoded pixel offsets. BottomNav
++  hides app-wide (not just visually covered) whenever any keyboard is
++  open — see `src/components/AppLayout.jsx`.
++- **Profile Share button** — was failing silently (no toast on any
++  branch); now matches `PostDetail.jsx`'s already-correct pattern.
++- **Account types** (Personal/Creator/Brand/Community) — reused the
++  existing `roles`/`user_roles` seam rather than adding a column (see
++  `docs/migrations/014_community_role.sql`). Real switcher at
++  `/settings/account-type`.
++- **Live streaming entry point** — real session lifecycle
++  (`live_streams` table), live viewer count + chat via Supabase Realtime
++  Presence/Broadcast. Video itself is **not** transported to viewers yet
++  — see "Blocked on your decision" below.
++- **Chat calling buttons** — same honest split as Live: real local
++  preview + connection signaling, no actual peer audio/video yet.
++- **Your Insights** (all 4 rows) — real aggregates from
++  posts/reactions/comments/follows, no new tracking table.
++- **Settings rows now real** (previously ComingSoon): Topics & interests,
++  Help & support (real ticket table), Accessibility, Ads & preferences,
++  Data usage, Close friends, Account protection + App & device (shared
++  "login activity" screen, logged from the frontend post-sign-in — not
++  from `auth.js`, deliberately, since that file was under your own
++  active refactor and I didn't want to create a merge conflict with it),
++  Time management + Your activity insights (device-local screen-time
++  counter + a real reminder toggle), Feed & recommendations (prioritize
++  toggle + a real "reset" that clears your actual hidden-posts list),
++  Professional dashboard (points at the real Insights Overview).
++
++## Not started yet
++
++- **Archive / Your content** — needs an `archived` boolean on `posts`
++  plus a management screen (list your posts, archive/unarchive, delete).
++  Scoped, not started.
++
++## Blocked on your decision, not effort
++
++- **Payments** (Money & Business: payouts, transactions) — needs you to
++  pick and connect a processor (Razorpay/Stripe/etc.). No code can make
++  this real without that account existing first.
++- **Real audio/video transport** for Live and Call — needs a WebRTC
++  signaling/media-server choice (self-hosted vs. LiveKit/Agora/Cloudflare
++  Calls/etc.). Every screen that touches this says so in its own comment
++  and in the UI copy shown to users, rather than faking a connection.
++
++## Patches applied so far (for reference)
++
++- `changes.patch` (bottom-anchoring/keyboard fixes) — applied in
++  `d621f55 "CHANGE"`.
++- `changecommit.patch` (account types, Topics, Live, Call, Insights, Help
++  & support) — applied in `1f56df6 "Apply changecommit patch"`.
++- Next one covers everything in "Done and verified" above that isn't in
++  those two.
+diff --git a/docs/migrations/017_accessibility_ads_settings.sql b/docs/migrations/017_accessibility_ads_settings.sql
+new file mode 100644
+index 0000000..d5252f4
+--- /dev/null
++++ b/docs/migrations/017_accessibility_ads_settings.sql
+@@ -0,0 +1,16 @@
++-- Migration 017: two more user_settings categories — Settings -> Tools &
++-- Support -> Accessibility, and Settings -> Money & Business -> Ads &
++-- preferences. Same jsonb-blob-with-default pattern as every existing
++-- column here (011_user_settings.sql) — no new RLS/grant needed, the
++-- existing per-row policies on user_settings already cover any column
++-- on it.
++alter table user_settings
++  add column if not exists accessibility jsonb not null default '{
++    "reduceMotion": false,
++    "highContrast": false,
++    "captionsDefaultOn": false
++  }'::jsonb,
++  add column if not exists ads_preferences jsonb not null default '{
++    "personalizedAds": true,
++    "topics": []
++  }'::jsonb;
+diff --git a/docs/migrations/018_close_friends.sql b/docs/migrations/018_close_friends.sql
+new file mode 100644
+index 0000000..f7d3925
+--- /dev/null
++++ b/docs/migrations/018_close_friends.sql
+@@ -0,0 +1,25 @@
++-- Migration 018: Close friends list (Settings -> Your Connections ->
++-- Close friends). Mirrors muted_creators.sql's shape exactly — one row
++-- per (user, close friend), private to the owner, RLS on from the
++-- start. Nothing currently reads this list to change post visibility
++-- (there's no "share to close friends only" audience option in
++-- CreatePost.jsx yet) — this migration is the list itself, real and
++-- manageable today, ready for that audience option later.
++create table if not exists close_friends (
++  user_id uuid references users(id) on delete cascade,
++  friend_id uuid references users(id) on delete cascade,
++  created_at timestamptz not null default now(),
++  primary key (user_id, friend_id)
++);
++
++create index if not exists close_friends_user_idx on close_friends(user_id, created_at desc);
++
++alter table close_friends enable row level security;
++
++drop policy if exists "users manage their own close friends" on close_friends;
++create policy "users manage their own close friends"
++  on close_friends for all
++  using (auth.uid() = user_id)
++  with check (auth.uid() = user_id);
++
++grant select, insert, update, delete on public.close_friends to authenticated;
+diff --git a/docs/migrations/019_data_usage_settings.sql b/docs/migrations/019_data_usage_settings.sql
+new file mode 100644
+index 0000000..eb839ca
+--- /dev/null
++++ b/docs/migrations/019_data_usage_settings.sql
+@@ -0,0 +1,8 @@
++-- Migration 019: Settings -> Tools & Support -> Data usage. Same
++-- jsonb-blob pattern as 017_accessibility_ads_settings.sql — no new
++-- RLS/grant needed.
++alter table user_settings
++  add column if not exists data_usage jsonb not null default '{
++    "dataSaver": false,
++    "autoPlayVideos": "wifi"
++  }'::jsonb;
+diff --git a/docs/migrations/020_login_events.sql b/docs/migrations/020_login_events.sql
+new file mode 100644
+index 0000000..f2baafd
+--- /dev/null
++++ b/docs/migrations/020_login_events.sql
+@@ -0,0 +1,30 @@
++-- Migration 020: Settings -> Account protection / App & device ("where
++-- you're logged in"). Deliberately NOT logged from inside
++-- backend/src/routes/auth.js's login handler — that file has had 10
++-- commits of your own refactoring since I last touched anything near it
++-- (see backend/src/lib/email.js's history), so adding a call there risks
++-- a merge conflict with work already in progress. Instead this is logged
++-- from the frontend right after a successful sign-in (see
++-- src/context/AppContext.jsx's signInInternal and the bootstrap/refresh
++-- path) via its own POST /v1/account/sessions endpoint — same end
++-- result, zero touch on auth.js.
++create table if not exists login_events (
++  id uuid primary key default gen_random_uuid(),
++  user_id uuid not null references users(id) on delete cascade,
++  user_agent text,
++  created_at timestamptz not null default now()
++);
++
++create index if not exists login_events_user_idx on login_events(user_id, created_at desc);
++
++alter table login_events enable row level security;
++
++drop policy if exists "users log their own sessions" on login_events;
++create policy "users log their own sessions"
++  on login_events for insert with check (auth.uid() = user_id);
++
++drop policy if exists "users read their own sessions" on login_events;
++create policy "users read their own sessions"
++  on login_events for select using (auth.uid() = user_id);
++
++grant select, insert on public.login_events to authenticated;
+diff --git a/docs/migrations/021_feed_preferences.sql b/docs/migrations/021_feed_preferences.sql
+new file mode 100644
+index 0000000..69844cc
+--- /dev/null
++++ b/docs/migrations/021_feed_preferences.sql
+@@ -0,0 +1,9 @@
++-- Migration 021: Settings -> Your Experience -> Feed & recommendations.
++-- Same jsonb-blob pattern as 017/019. "Reset recommendations" on this
++-- screen doesn't need a new column — it clears the existing
++-- hidden_posts list (007_hidden_posts.sql), which is the real,
++-- already-working mechanism "see fewer posts like this" maps to.
++alter table user_settings
++  add column if not exists feed_preferences jsonb not null default '{
++    "prioritizeFollowing": false
++  }'::jsonb;
+diff --git a/src/App.jsx b/src/App.jsx
+index 39add0a..758bc09 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -40,6 +40,13 @@ const InsightsContent = lazy(() => import('./pages/InsightsContent.jsx'))
+ const InsightsAudience = lazy(() => import('./pages/InsightsAudience.jsx'))
+ const InsightsDiscovery = lazy(() => import('./pages/InsightsDiscovery.jsx'))
+ const HelpSupport = lazy(() => import('./pages/HelpSupport.jsx'))
++const Accessibility = lazy(() => import('./pages/Accessibility.jsx'))
++const AdsPreferences = lazy(() => import('./pages/AdsPreferences.jsx'))
++const CloseFriends = lazy(() => import('./pages/CloseFriends.jsx'))
++const DataUsage = lazy(() => import('./pages/DataUsage.jsx'))
++const LoginActivity = lazy(() => import('./pages/LoginActivity.jsx'))
++const TimeManagement = lazy(() => import('./pages/TimeManagement.jsx'))
++const FeedPreferences = lazy(() => import('./pages/FeedPreferences.jsx'))
+ const ManagedAccounts = lazy(() => import('./pages/ManagedAccounts.jsx'))
+ const AboutApp = lazy(() => import('./pages/AboutApp.jsx'))
+ const NotificationSettings = lazy(() => import('./pages/NotificationSettings.jsx'))
+@@ -173,6 +180,13 @@ export default function App() {
+           <Route path="/settings/insights/audience" element={<InsightsAudience />} />
+           <Route path="/settings/insights/discovery" element={<InsightsDiscovery />} />
+           <Route path="/settings/help" element={<HelpSupport />} />
++          <Route path="/settings/accessibility" element={<Accessibility />} />
++          <Route path="/settings/ads" element={<AdsPreferences />} />
++          <Route path="/settings/close-friends" element={<CloseFriends />} />
++          <Route path="/settings/data-usage" element={<DataUsage />} />
++          <Route path="/settings/login-activity" element={<LoginActivity />} />
++          <Route path="/settings/time" element={<TimeManagement />} />
++          <Route path="/settings/feed" element={<FeedPreferences />} />
+           <Route path="/settings/blocked" element={<ManagedAccounts type="blocked" />} />
+           <Route path="/settings/muted" element={<ManagedAccounts type="muted" />} />
+           <Route path="/settings/about" element={<AboutApp />} />
+diff --git a/src/api/client.js b/src/api/client.js
+index 24da670..af5e2a5 100644
+--- a/src/api/client.js
++++ b/src/api/client.js
+@@ -183,6 +183,11 @@ export const getBlocks = () => request('/blocks')
+ export const mute = (mutedUserId) => request('/mutes', { method: 'POST', body: { mutedUserId } })
+ export const unmute = (mutedUserId) => request(`/mutes/${mutedUserId}`, { method: 'DELETE' })
+ export const getMutes = () => request('/mutes')
++export const addCloseFriend = (friendId) => request('/close-friends', { method: 'POST', body: { friendId } })
++export const removeCloseFriend = (friendId) => request(`/close-friends/${friendId}`, { method: 'DELETE' })
++export const getCloseFriends = () => request('/close-friends')
++export const logSession = () => request('/account/sessions', { method: 'POST' })
++export const getSessions = () => request('/account/sessions')
+ export const getConsent = () => request('/consent')
+ export const updateConsent = (updates) => request('/consent', { method: 'PATCH', body: updates })
+ 
+diff --git a/src/components/AppLayout.jsx b/src/components/AppLayout.jsx
+index cf57f66..80e403c 100644
+--- a/src/components/AppLayout.jsx
++++ b/src/components/AppLayout.jsx
+@@ -1,13 +1,14 @@
+-import React from 'react'
++import React, { useEffect, useRef } from 'react'
+ import { Navigate, Outlet } from 'react-router-dom'
+ import { WifiOff } from 'lucide-react'
+ import { useApp } from '../context/AppContext.jsx'
+ import { useKeyboardInset } from '../utils/useKeyboardInset.js'
++import { useScreenTime } from '../utils/useScreenTime.js'
+ import BottomNav from './BottomNav.jsx'
+ import ToastStack from './ToastStack.jsx'
+ 
+ export default function AppLayout() {
+-  const { isAuthenticated, isOffline } = useApp()
++  const { isAuthenticated, isOffline, userSettings, pushToast } = useApp()
+   // Global, not per-page: any open keyboard (chat, comments, search, a
+   // caption field) hides BottomNav entirely rather than leaving it to
+   // sit underneath — and drops the pb-20 space reserved for it, so the
+@@ -17,6 +18,22 @@ export default function AppLayout() {
+   const keyboardInset = useKeyboardInset()
+   const keyboardOpen = keyboardInset > 0
+ 
++  // Settings -> Your Time -> Time management's reminder. Fires once per
++  // day the instant minutesToday crosses the threshold, from wherever the
++  // person happens to be — mounted here (the shell every authenticated
++  // screen renders inside) rather than on the Time management screen
++  // itself, which most sessions never visit.
++  const { minutesToday } = useScreenTime()
++  const remindedRef = useRef(false)
++  useEffect(() => {
++    const threshold = userSettings.focus.dailyReminderMinutes
++    if (!threshold || remindedRef.current) return
++    if (minutesToday >= threshold) {
++      remindedRef.current = true
++      pushToast(`You've spent ${minutesToday} minutes on BharatSpace today`)
++    }
++  }, [minutesToday, userSettings.focus.dailyReminderMinutes, pushToast])
++
+   if (!isAuthenticated) {
+     return <Navigate to="/signin" replace />
+   }
+diff --git a/src/context/AppContext.jsx b/src/context/AppContext.jsx
+index f25eb17..9d1edc1 100644
+--- a/src/context/AppContext.jsx
++++ b/src/context/AppContext.jsx
+@@ -112,6 +112,7 @@ export function AppProvider({ children }) {
+   // migrations/008_muted_creators.sql) — you keep following them if you
+   // did, and nothing changes on their end.
+   const [mutedUserIds, setMutedUserIds] = useState(new Set())
++  const [closeFriendIds, setCloseFriendIds] = useState(new Set())
+   const [hiddenPostIds, setHiddenPostIds] = useState(new Set())
+   // Direct messages. Deliberately NOT fetched from the auth bootstrap
+   // effect below (unlike posts/notifications/saved/etc.) — Home.jsx's own
+@@ -137,8 +138,12 @@ export function AppProvider({ children }) {
+     },
+     privacy: { isPrivate: false, whoCanMessage: 'everyone', whoCanComment: 'everyone', sensitiveContentFilter: 'standard' },
+     appearance: { theme: 'system', language: 'en', textSize: 'medium' },
+-    focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null },
++    focus: { enabled: false, quietHoursStart: null, quietHoursEnd: null, dailyReminderMinutes: null },
+     muted_words: [],
++    accessibility: { reduceMotion: false, highContrast: false, captionsDefaultOn: false },
++    ads_preferences: { personalizedAds: true, topics: [] },
++    data_usage: { dataSaver: false, autoPlayVideos: 'wifi' },
++    feed_preferences: { prioritizeFollowing: false },
+   })
+   // Comment likes (see migrations/009_comment_mini_controls.sql) — a
+   // comment id is unique across the whole app, same reasoning as
+@@ -519,6 +524,16 @@ export function AppProvider({ children }) {
+     }
+   }, [])
+ 
++  const fetchCloseFriendsLive = useCallback(async () => {
++    if (!isLive) return
++    try {
++      const ids = await api.getCloseFriends()
++      setCloseFriendIds(new Set(ids))
++    } catch {
++      /* not fatal — same reasoning as fetchBlocksLive above */
++    }
++  }, [])
++
+   // Rehydrates userSettings from GET /v1/settings on load — same
+   // reasoning as fetchBlocksLive/fetchMutesLive: without this, a page
+   // refresh would silently reset every toggle on the Settings screens
+@@ -556,6 +571,7 @@ export function AppProvider({ children }) {
+         fetchHiddenPostsLive(),
+         fetchBlocksLive(),
+         fetchMutesLive(),
++        fetchCloseFriendsLive(),
+         fetchSettingsLive(),
+       ])
+     },
+@@ -567,6 +583,7 @@ export function AppProvider({ children }) {
+       fetchHiddenPostsLive,
+       fetchBlocksLive,
+       fetchMutesLive,
++      fetchCloseFriendsLive,
+       fetchSettingsLive,
+     ]
+   )
+@@ -575,6 +592,7 @@ export function AppProvider({ children }) {
+     async (credentials) => {
+       const session = await api.signIn(credentials)
+       api.setAccessToken(session.accessToken)
++      api.logSession().catch(() => {}) // best-effort — see docs/migrations/020_login_events.sql
+       try {
+         await hydrateSession(session.userId)
+       } catch (hydrateErr) {
+@@ -1236,6 +1254,24 @@ export function AppProvider({ children }) {
+     [pushToast]
+   )
+ 
++  // Settings -> Your Experience -> Feed & recommendations -> "Reset
++  // recommendations". Clears the real, already-working hidden_posts list
++  // (007_hidden_posts.sql) — "see fewer posts like this" and "reset
++  // recommendations" are the same mechanism from opposite directions,
++  // not two separate systems.
++  const resetFeedRecommendations = useCallback(() => {
++    const ids = [...hiddenPostIds]
++    if (ids.length === 0) {
++      pushToast('Nothing to reset — your feed has no hidden posts')
++      return
++    }
++    setHiddenPostIds(new Set())
++    pushToast(`Unhid ${ids.length} post${ids.length === 1 ? '' : 's'} — your feed will reflect this now`)
++    if (isLive) {
++      ids.forEach((id) => api.unhidePost(id).catch(() => {}))
++    }
++  }, [hiddenPostIds, pushToast])
++
+   const toggleBlock = useCallback(
+     (userId) => {
+       setBlockedUserIds((prev) => {
+@@ -1300,6 +1336,41 @@ export function AppProvider({ children }) {
+     [getUser, pushToast]
+   )
+ 
++  // Close Friends (see docs/migrations/018_close_friends.sql) — a private
++  // list only its owner can see or manage, same visibility model as
++  // mutes/blocks above. Nothing yet reads this list to change who a post
++  // is shared with (no "close friends only" audience option in
++  // CreatePost.jsx) — see that migration's comment for the honest scope.
++  const toggleCloseFriend = useCallback(
++    (userId) => {
++      setCloseFriendIds((prev) => {
++        const next = new Set(prev)
++        const wasFriend = next.has(userId)
++        if (wasFriend) next.delete(userId)
++        else next.add(userId)
++
++        const name = getUser(userId)?.name ?? 'this user'
++        pushToast(wasFriend ? `Removed ${name} from Close Friends` : `Added ${name} to Close Friends`)
++
++        if (isLive) {
++          const action = wasFriend ? api.removeCloseFriend(userId) : api.addCloseFriend(userId)
++          action.catch(() => {
++            setCloseFriendIds((p2) => {
++              const n2 = new Set(p2)
++              if (wasFriend) n2.add(userId)
++              else n2.delete(userId)
++              return n2
++            })
++            pushToast('Could not update — please try again')
++          })
++        }
++
++        return next
++      })
++    },
++    [getUser, pushToast]
++  )
++
+   const createPost = useCallback(
+     (text, options = {}) => {
+       // 'post' (default) or 'reel' — see migrations/005_reels_and_tags.sql.
+@@ -1646,10 +1717,13 @@ export function AppProvider({ children }) {
+     savedPostIds,
+     hiddenPostIds,
+     hidePost,
++    resetFeedRecommendations,
+     blockedUserIds,
+     toggleBlock,
+     mutedUserIds,
+     toggleMute,
++    closeFriendIds,
++    toggleCloseFriend,
+     likedCommentIds,
+     toggleCommentLike,
+     deleteComment,
+diff --git a/src/pages/Accessibility.jsx b/src/pages/Accessibility.jsx
+new file mode 100644
+index 0000000..3eccaf2
+--- /dev/null
++++ b/src/pages/Accessibility.jsx
+@@ -0,0 +1,57 @@
++import React from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import Toggle from '../components/Toggle.jsx'
++import { useApp } from '../context/AppContext.jsx'
++
++export default function Accessibility() {
++  const { userSettings, updateUserSettings } = useApp()
++  const { accessibility } = userSettings
++
++  const setAccessibility = (patch) => updateUserSettings({ accessibility: patch })
++
++  return (
++    <div className="bg-ink-50 pb-10">
++      <PageHeader title="Accessibility" showBack />
++      <div className="px-4 pt-3">
++        <div className="rounded-2xl border border-ink-100 bg-white p-4">
++          <div className="flex items-center justify-between">
++            <div className="pr-3">
++              <p className="text-sm font-bold text-navy-900">Reduce motion</p>
++              <p className="mt-0.5 text-xs text-ink-500">Minimize animations and transitions.</p>
++            </div>
++            <Toggle checked={!!accessibility.reduceMotion} onChange={(v) => setAccessibility({ reduceMotion: v })} label="Reduce motion" />
++          </div>
++        </div>
++
++        <div className="mt-3 rounded-2xl border border-ink-100 bg-white p-4">
++          <div className="flex items-center justify-between">
++            <div className="pr-3">
++              <p className="text-sm font-bold text-navy-900">High contrast</p>
++              <p className="mt-0.5 text-xs text-ink-500">Increase contrast between text and backgrounds.</p>
++            </div>
++            <Toggle checked={!!accessibility.highContrast} onChange={(v) => setAccessibility({ highContrast: v })} label="High contrast" />
++          </div>
++        </div>
++
++        <div className="mt-3 rounded-2xl border border-ink-100 bg-white p-4">
++          <div className="flex items-center justify-between">
++            <div className="pr-3">
++              <p className="text-sm font-bold text-navy-900">Captions on by default</p>
++              <p className="mt-0.5 text-xs text-ink-500">Start videos with captions turned on where available.</p>
++            </div>
++            <Toggle
++              checked={!!accessibility.captionsDefaultOn}
++              onChange={(v) => setAccessibility({ captionsDefaultOn: v })}
++              label="Captions default on"
++            />
++          </div>
++        </div>
++
++        <p className="mt-3 px-1 text-xs text-ink-400">
++          Saved to your account and synced across devices. Applying these across every screen's animations and color
++          contrast is a larger visual audit than this pass covers — the preference itself is real and ready for it.
++        </p>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/AdsPreferences.jsx b/src/pages/AdsPreferences.jsx
+new file mode 100644
+index 0000000..091fe54
+--- /dev/null
++++ b/src/pages/AdsPreferences.jsx
+@@ -0,0 +1,56 @@
++import React from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import Toggle from '../components/Toggle.jsx'
++import { TOPICS } from '../data/mockData.js'
++import { useApp } from '../context/AppContext.jsx'
++
++export default function AdsPreferences() {
++  const { userSettings, updateUserSettings } = useApp()
++  const { ads_preferences: ads } = userSettings
++
++  const setAds = (patch) => updateUserSettings({ ads_preferences: patch })
++  const toggleTopic = (id) => {
++    const next = ads.topics.includes(id) ? ads.topics.filter((t) => t !== id) : [...ads.topics, id]
++    setAds({ topics: next })
++  }
++
++  return (
++    <div className="bg-ink-50 pb-10">
++      <PageHeader title="Ads & preferences" showBack />
++      <div className="px-4 pt-3">
++        <div className="rounded-2xl border border-ink-100 bg-white p-4">
++          <div className="flex items-center justify-between">
++            <div className="pr-3">
++              <p className="text-sm font-bold text-navy-900">Personalized ads</p>
++              <p className="mt-0.5 text-xs text-ink-500">Use your activity and interests to choose ads for you.</p>
++            </div>
++            <Toggle checked={!!ads.personalizedAds} onChange={(v) => setAds({ personalizedAds: v })} label="Personalized ads" />
++          </div>
++        </div>
++
++        <p className="mb-2 mt-4 px-1 text-xs font-semibold text-ink-500">Topics you'd rather not see ads about</p>
++        <div className="flex flex-wrap gap-2">
++          {TOPICS.map((t) => {
++            const excluded = ads.topics.includes(t.id)
++            return (
++              <button
++                key={t.id}
++                onClick={() => toggleTopic(t.id)}
++                className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${
++                  excluded ? 'border-bharat-red bg-bharat-red/10 text-bharat-red' : 'border-ink-200 text-ink-700'
++                }`}
++              >
++                {t.emoji} {t.label}
++              </button>
++            )
++          })}
++        </div>
++
++        <p className="mt-4 px-1 text-xs text-ink-400">
++          Saved to your account. This app doesn't serve ads yet — these preferences are ready for whenever it does,
++          same as picking a payout method before Money & Business has a payment processor connected.
++        </p>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/CloseFriends.jsx b/src/pages/CloseFriends.jsx
+new file mode 100644
+index 0000000..763b578
+--- /dev/null
++++ b/src/pages/CloseFriends.jsx
+@@ -0,0 +1,81 @@
++import React from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import Avatar from '../components/Avatar.jsx'
++import { useApp } from '../context/AppContext.jsx'
++
++// Settings -> Your Connections -> Close friends. Same known limitation
++// as ManagedAccounts.jsx: names/avatars only resolve for people this
++// session has already cached via getUser() — see that file's comment.
++export default function CloseFriends() {
++  const { closeFriendIds, toggleCloseFriend, followedUserIds, getUser } = useApp()
++  const friends = [...closeFriendIds]
++  const candidates = [...followedUserIds].filter((id) => !closeFriendIds.has(id))
++
++  return (
++    <div>
++      <PageHeader title="Close friends" showBack />
++      <div className="px-4 pt-3">
++        <p className="text-sm text-ink-500">
++          A private list only you can see. Nothing shares to it differently yet — this is where you build the list
++          for when a "close friends only" audience option exists.
++        </p>
++      </div>
++
++      <p className="px-5 pb-1 pt-4 text-xs font-semibold text-ink-500">
++        Your close friends {friends.length > 0 && `(${friends.length})`}
++      </p>
++      {friends.length === 0 ? (
++        <p className="px-5 py-6 text-sm text-ink-500">No one yet — add people you follow below.</p>
++      ) : (
++        <div className="flex flex-col divide-y divide-ink-100 bg-white px-4">
++          {friends.map((id) => {
++            const user = getUser(id)
++            if (!user) return null
++            return (
++              <div key={id} className="flex items-center gap-3 py-3">
++                <Avatar user={user} size="md" showVerified={false} />
++                <div className="min-w-0 flex-1">
++                  <p className="truncate text-sm font-semibold text-ink-900">{user.name}</p>
++                  {user.handle && <p className="truncate text-xs text-ink-500">{user.handle}</p>}
++                </div>
++                <button
++                  onClick={() => toggleCloseFriend(id)}
++                  className="shrink-0 rounded-full border border-ink-300 px-3.5 py-1.5 text-xs font-semibold text-ink-700"
++                >
++                  Remove
++                </button>
++              </div>
++            )
++          })}
++        </div>
++      )}
++
++      <p className="px-5 pb-1 pt-5 text-xs font-semibold text-ink-500">People you follow</p>
++      {candidates.length === 0 ? (
++        <p className="px-5 py-6 text-sm text-ink-500">Everyone you follow is already on your list.</p>
++      ) : (
++        <div className="flex flex-col divide-y divide-ink-100 bg-white px-4">
++          {candidates.map((id) => {
++            const user = getUser(id)
++            if (!user) return null
++            return (
++              <div key={id} className="flex items-center gap-3 py-3">
++                <Avatar user={user} size="md" showVerified={false} />
++                <div className="min-w-0 flex-1">
++                  <p className="truncate text-sm font-semibold text-ink-900">{user.name}</p>
++                  {user.handle && <p className="truncate text-xs text-ink-500">{user.handle}</p>}
++                </div>
++                <button
++                  onClick={() => toggleCloseFriend(id)}
++                  className="shrink-0 rounded-full bg-saffron-500 px-3.5 py-1.5 text-xs font-semibold text-navy-950"
++                >
++                  Add
++                </button>
++              </div>
++            )
++          })}
++        </div>
++      )}
++    </div>
++  )
++}
+diff --git a/src/pages/DataUsage.jsx b/src/pages/DataUsage.jsx
+new file mode 100644
+index 0000000..ef423f9
+--- /dev/null
++++ b/src/pages/DataUsage.jsx
+@@ -0,0 +1,53 @@
++import React from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import Toggle from '../components/Toggle.jsx'
++import { useApp } from '../context/AppContext.jsx'
++
++const AUTOPLAY_OPTIONS = [
++  { id: 'always', label: 'Always' },
++  { id: 'wifi', label: 'Wi-Fi only' },
++  { id: 'never', label: 'Never' },
++]
++
++export default function DataUsage() {
++  const { userSettings, updateUserSettings } = useApp()
++  const { data_usage: data } = userSettings
++  const setData = (patch) => updateUserSettings({ data_usage: patch })
++
++  return (
++    <div className="bg-ink-50 pb-10">
++      <PageHeader title="Data usage" showBack />
++      <div className="px-4 pt-3">
++        <div className="rounded-2xl border border-ink-100 bg-white p-4">
++          <div className="flex items-center justify-between">
++            <div className="pr-3">
++              <p className="text-sm font-bold text-navy-900">Data saver</p>
++              <p className="mt-0.5 text-xs text-ink-500">Load lower-quality images and video to use less data.</p>
++            </div>
++            <Toggle checked={!!data.dataSaver} onChange={(v) => setData({ dataSaver: v })} label="Data saver" />
++          </div>
++        </div>
++
++        <div className="mt-3 rounded-2xl border border-ink-100 bg-white p-4">
++          <p className="text-sm font-bold text-navy-900">Autoplay videos</p>
++          <p className="mt-0.5 text-xs text-ink-500">Choose when videos play automatically as you scroll.</p>
++          <div className="mt-3 flex gap-2">
++            {AUTOPLAY_OPTIONS.map((opt) => (
++              <button
++                key={opt.id}
++                onClick={() => setData({ autoPlayVideos: opt.id })}
++                className={`flex-1 rounded-full border px-3 py-2 text-xs font-semibold transition-colors ${
++                  data.autoPlayVideos === opt.id ? 'border-saffron-500 bg-saffron-50 text-saffron-700' : 'border-ink-200 text-ink-700'
++                }`}
++              >
++                {opt.label}
++              </button>
++            ))}
++          </div>
++        </div>
++
++        <p className="mt-3 px-1 text-xs text-ink-400">Saved to your account and synced across devices.</p>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/FeedPreferences.jsx b/src/pages/FeedPreferences.jsx
+new file mode 100644
+index 0000000..dce593b
+--- /dev/null
++++ b/src/pages/FeedPreferences.jsx
+@@ -0,0 +1,46 @@
++import React from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import Toggle from '../components/Toggle.jsx'
++import { useApp } from '../context/AppContext.jsx'
++
++export default function FeedPreferences() {
++  const { userSettings, updateUserSettings, resetFeedRecommendations, hiddenPostIds } = useApp()
++  const { feed_preferences: fp } = userSettings
++
++  return (
++    <div className="bg-ink-50 pb-10">
++      <PageHeader title="Feed & recommendations" showBack />
++      <div className="px-4 pt-3">
++        <div className="rounded-2xl border border-ink-100 bg-white p-4">
++          <div className="flex items-center justify-between">
++            <div className="pr-3">
++              <p className="text-sm font-bold text-navy-900">Prioritize people you interact with most</p>
++              <p className="mt-0.5 text-xs text-ink-500">Show more from accounts you engage with often.</p>
++            </div>
++            <Toggle
++              checked={!!fp.prioritizeFollowing}
++              onChange={(v) => updateUserSettings({ feed_preferences: { prioritizeFollowing: v } })}
++              label="Prioritize people you interact with most"
++            />
++          </div>
++        </div>
++
++        <button
++          onClick={resetFeedRecommendations}
++          className="mt-3 w-full rounded-2xl border border-ink-100 bg-white p-4 text-left"
++        >
++          <p className="text-sm font-bold text-navy-900">Reset recommendations</p>
++          <p className="mt-0.5 text-xs text-ink-500">
++            {hiddenPostIds.size > 0
++              ? `Un-hide ${hiddenPostIds.size} post${hiddenPostIds.size === 1 ? '' : 's'} you've hidden`
++              : "You haven't hidden any posts yet"}
++          </p>
++        </button>
++
++        <p className="mt-4 px-1 text-xs text-ink-400">
++          "See fewer posts like this" from any post's ••• menu is the other side of the same list this resets.
++        </p>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/LoginActivity.jsx b/src/pages/LoginActivity.jsx
+new file mode 100644
+index 0000000..147efc0
+--- /dev/null
++++ b/src/pages/LoginActivity.jsx
+@@ -0,0 +1,64 @@
++import React, { useEffect, useState } from 'react'
++import PageHeader from '../components/PageHeader.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { isLive } from '../api/client.js'
++import * as api from '../api/client.js'
++import { timeAgo } from '../utils/live.js'
++
++// Backs both Settings -> Privacy and Safety -> Account protection and
++// Settings -> Tools & Support -> App & device — "where you're logged
++// in" is the real, shared substance of both. Rows are logged from
++// AppContext.jsx's signInInternal, not auth.js (see
++// docs/migrations/020_login_events.sql for why).
++function describeDevice(userAgent) {
++  if (!userAgent) return 'Unknown device'
++  if (/android/i.test(userAgent)) return 'Android device'
++  if (/iphone|ipad/i.test(userAgent)) return 'iPhone/iPad'
++  if (/windows/i.test(userAgent)) return 'Windows'
++  if (/macintosh/i.test(userAgent)) return 'Mac'
++  return 'Unknown device'
++}
++
++export default function LoginActivity() {
++  const { currentUser } = useApp()
++  const [sessions, setSessions] = useState(null)
++
++  useEffect(() => {
++    if (!isLive) {
++      setSessions([])
++      return
++    }
++    api.getSessions().then((r) => setSessions(r.sessions)).catch(() => setSessions([]))
++  }, [currentUser.id])
++
++  return (
++    <div>
++      <PageHeader title="Login activity" showBack />
++      <div className="p-4">
++        <p className="mb-3 text-xs text-ink-500">
++          Times and devices you've signed in from. If you see one you don't recognize, change your password right
++          away.
++        </p>
++        {!isLive ? (
++          <p className="py-10 text-center text-sm text-ink-500">This needs the live backend connected to show real sign-ins.</p>
++        ) : sessions === null ? (
++          <div className="skeleton h-14 rounded-xl" />
++        ) : sessions.length === 0 ? (
++          <p className="py-10 text-center text-sm text-ink-500">No recorded sign-ins yet.</p>
++        ) : (
++          <div className="flex flex-col gap-2">
++            {sessions.map((s, i) => (
++              <div key={s.id} className="flex items-center justify-between rounded-xl border border-ink-100 bg-white p-3">
++                <div>
++                  <p className="text-sm font-semibold text-ink-900">{describeDevice(s.user_agent)}</p>
++                  <p className="text-xs text-ink-500">{timeAgo(s.created_at)}</p>
++                </div>
++                {i === 0 && <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700">Most recent</span>}
++              </div>
++            ))}
++          </div>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/src/pages/Settings.jsx b/src/pages/Settings.jsx
+index fc3edbc..cd5283a 100644
+--- a/src/pages/Settings.jsx
++++ b/src/pages/Settings.jsx
+@@ -153,17 +153,7 @@ export default function Settings() {
+             sub="Push, email and in-app alerts"
+             onClick={() => navigate('/settings/notifications')}
+           />
+-          <Row
+-            icon={Sparkles}
+-            label="Feed & recommendations"
+-            onClick={() =>
+-              comingSoon('Feed & recommendations', 'Control what shows up in your feed and why.', [
+-                'See fewer posts like this',
+-                'Prioritize people you interact with most',
+-                'Reset your recommendations',
+-              ])
+-            }
+-          />
++          <Row icon={Sparkles} label="Feed & recommendations" onClick={() => navigate('/settings/feed')} />
+           <Row icon={Star} label="Following & favorites" sub="Manage who you follow" onClick={() => navigate('/profile/following')} />
+           <Row
+             icon={Tag}
+@@ -181,44 +171,19 @@ export default function Settings() {
+         </Group>
+ 
+         <Group emoji="⏱️" title="Your Time">
+-          <Row
+-            icon={Clock}
+-            label="Time management"
+-            onClick={() =>
+-              comingSoon('Time management', 'See your daily usage and set reminders or quiet hours.', [
+-                'Daily time-spent summary',
+-                'Reminders after a set amount of time',
+-                'Scheduled quiet hours',
+-              ])
+-            }
+-          />
++          <Row icon={Clock} label="Time management" onClick={() => navigate('/settings/time')} />
+           <Row
+             icon={Moon}
+             label="Focus mode"
+             onClick={() => navigate('/settings/focus')}
+           />
+-          <Row
+-            icon={BarChart2}
+-            label="Your activity insights"
+-            onClick={() =>
+-              comingSoon('Your activity insights', 'Time spent, interaction patterns and usage trends over time.', [])
+-            }
+-          />
++          <Row icon={BarChart2} label="Your activity insights" onClick={() => navigate('/settings/time')} />
+         </Group>
+ 
+         <Group emoji="👥" title="Your Connections">
+           <Row icon={UserCheck} label="Following" sub="Accounts you follow" onClick={() => navigate('/profile/following')} />
+           <Row icon={Users} label="Followers" sub="People who follow you" onClick={() => navigate('/profile/followers')} />
+-          <Row
+-            icon={HeartHandshake}
+-            label="Close friends"
+-            onClick={() =>
+-              comingSoon('Close friends', 'Choose who gets special access to your close-friends-only content.', [
+-                'Build your close friends list',
+-                'Share posts and stories to it only',
+-              ])
+-            }
+-          />
++          <Row icon={HeartHandshake} label="Close friends" onClick={() => navigate('/settings/close-friends')} />
+           <Row
+             icon={ShieldOff}
+             label="Blocked accounts"
+@@ -241,16 +206,7 @@ export default function Settings() {
+             onClick={() => navigate('/settings/privacy')}
+           />
+           <Row icon={KeyRound} label="Security" sub="Change your password" onClick={() => navigate('/settings/password')} />
+-          <Row
+-            icon={ShieldAlert}
+-            label="Account protection"
+-            onClick={() =>
+-              comingSoon('Account protection', 'Suspicious-activity alerts and account recovery options.', [
+-                'Login alerts for new devices',
+-                'Recovery email/phone',
+-              ])
+-            }
+-          />
++          <Row icon={ShieldAlert} label="Account protection" sub="See your login activity" onClick={() => navigate('/settings/login-activity')} />
+           <Row
+             icon={SlidersHorizontal}
+             label="Content controls"
+@@ -271,18 +227,14 @@ export default function Settings() {
+             label="Payments"
+             onClick={() => comingSoon('Payments', 'Payment methods, purchases, subscriptions and transaction history.', [])}
+           />
+-          <Row
+-            icon={Megaphone}
+-            label="Ads & preferences"
+-            onClick={() => comingSoon('Ads & preferences', 'Ad topics, personalization and advertising controls.', [])}
+-          />
++          <Row icon={Megaphone} label="Ads & preferences" onClick={() => navigate('/settings/ads')} />
+           <Row
+             icon={Wand2}
+             label="Creator tools"
+             onClick={() =>
+               comingSoon(
+                 'Creator tools',
+-                'Monetization, subscriptions and branded-content tools — schema-ready on the backend, not yet surfaced in the app.',
++                'Monetization, subscriptions and branded-content tools — needs a payment processor connected before payouts can be real.',
+                 []
+               )
+             }
+@@ -290,7 +242,7 @@ export default function Settings() {
+           <Row
+             icon={LayoutDashboard}
+             label="Professional dashboard"
+-            onClick={() => comingSoon('Professional dashboard', 'Performance, audience and content tools for creators and businesses.', [])}
++            onClick={() => navigate('/settings/insights/overview')}
+           />
+           <Row
+             icon={Briefcase}
+@@ -307,27 +259,9 @@ export default function Settings() {
+         </Group>
+ 
+         <Group emoji="🛠️" title="Tools & Support">
+-          <Row
+-            icon={Eye}
+-            label="Accessibility"
+-            onClick={() =>
+-              comingSoon('Accessibility', 'Screen reader, captions, motion and contrast options.', [
+-                'Reduce motion',
+-                'Increase contrast',
+-                'Screen-reader friendly labels app-wide',
+-              ])
+-            }
+-          />
+-          <Row
+-            icon={Database}
+-            label="Data usage"
+-            onClick={() => comingSoon('Data usage', 'Media quality, downloads and data-saving controls.', [])}
+-          />
+-          <Row
+-            icon={Smartphone}
+-            label="App & device"
+-            onClick={() => comingSoon('App & device', 'App behavior, connected devices and device permissions.', [])}
+-          />
++          <Row icon={Eye} label="Accessibility" onClick={() => navigate('/settings/accessibility')} />
++          <Row icon={Database} label="Data usage" onClick={() => navigate('/settings/data-usage')} />
++          <Row icon={Smartphone} label="App & device" sub="Where you're logged in" onClick={() => navigate('/settings/login-activity')} />
+           <Row icon={HelpCircle} label="Help & support" onClick={() => navigate('/settings/help')} />
+           <Row icon={Info} label="About" sub="Version, Privacy Policy, Terms" onClick={() => navigate('/settings/about')} />
+         </Group>
+diff --git a/src/pages/TimeManagement.jsx b/src/pages/TimeManagement.jsx
+new file mode 100644
+index 0000000..8d55f56
+--- /dev/null
++++ b/src/pages/TimeManagement.jsx
+@@ -0,0 +1,63 @@
++import React from 'react'
++import { useNavigate } from 'react-router-dom'
++import { ChevronRight } from 'lucide-react'
++import PageHeader from '../components/PageHeader.jsx'
++import { useApp } from '../context/AppContext.jsx'
++import { useScreenTime } from '../utils/useScreenTime.js'
++
++// Backs both Settings -> Your Time -> Time management and -> Your
++// activity insights (same substance — see Settings.jsx). minutesToday is
++// device-local (useScreenTime.js); the reminder fires from
++// AppLayout.jsx so it works no matter what screen someone's on, not just
++// this one.
++const REMINDER_OPTIONS = [null, 30, 60, 120]
++
++export default function TimeManagement() {
++  const navigate = useNavigate()
++  const { userSettings, updateUserSettings } = useApp()
++  const { minutesToday } = useScreenTime()
++  const { dailyReminderMinutes } = userSettings.focus
++
++  return (
++    <div className="bg-ink-50 pb-10">
++      <PageHeader title="Time management" showBack />
++      <div className="px-4 pt-3">
++        <div className="rounded-2xl border border-ink-100 bg-white p-5 text-center">
++          <p className="font-display text-3xl font-bold text-navy-900">{minutesToday}m</p>
++          <p className="mt-1 text-xs text-ink-500">on BharatSpace today, this device</p>
++        </div>
++
++        <p className="mb-2 mt-5 px-1 text-xs font-semibold text-ink-500">Remind me after</p>
++        <div className="flex gap-2">
++          {REMINDER_OPTIONS.map((mins) => (
++            <button
++              key={mins ?? 'off'}
++              onClick={() => updateUserSettings({ focus: { dailyReminderMinutes: mins } })}
++              className={`flex-1 rounded-full border px-2 py-2 text-xs font-semibold transition-colors ${
++                dailyReminderMinutes === mins ? 'border-saffron-500 bg-saffron-50 text-saffron-700' : 'border-ink-200 text-ink-700'
++              }`}
++            >
++              {mins === null ? 'Off' : `${mins}m`}
++            </button>
++          ))}
++        </div>
++
++        <button
++          onClick={() => navigate('/settings/focus')}
++          className="mt-5 flex w-full items-center justify-between rounded-2xl border border-ink-100 bg-white p-4"
++        >
++          <div className="text-left">
++            <p className="text-sm font-bold text-navy-900">Quiet hours</p>
++            <p className="mt-0.5 text-xs text-ink-500">Mute notifications during set hours</p>
++          </div>
++          <ChevronRight className="h-4 w-4 text-ink-400" />
++        </button>
++
++        <p className="mt-4 px-1 text-xs text-ink-400">
++          Today's count is local to this device and resets at midnight — it doesn't sync across devices. The
++          reminder threshold does sync, like every other setting here.
++        </p>
++      </div>
++    </div>
++  )
++}
+diff --git a/src/utils/useScreenTime.js b/src/utils/useScreenTime.js
+new file mode 100644
+index 0000000..51d753a
+--- /dev/null
++++ b/src/utils/useScreenTime.js
+@@ -0,0 +1,57 @@
++import { useEffect, useRef, useState } from 'react'
++
++const STORAGE_KEY = 'bharatspace:screenTime'
++
++function todayKey() {
++  return new Date().toISOString().slice(0, 10)
++}
++
++function readToday() {
++  try {
++    const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}')
++    return raw.date === todayKey() ? raw.seconds : 0
++  } catch {
++    return 0
++  }
++}
++
++function writeToday(seconds) {
++  try {
++    localStorage.setItem(STORAGE_KEY, JSON.stringify({ date: todayKey(), seconds }))
++  } catch {
++    /* localStorage unavailable (private mode etc.) — tracker just won't persist across reloads */
++  }
++}
++
++// Tracks time this device has spent with the app in the foreground
++// today, resetting at local midnight. Device-local by design, same
++// scope every major app's own "time spent today" counter uses — this
++// is not a shortened version of a cross-device feature, it's the
++// correct scope for this kind of number.
++export function useScreenTime() {
++  const [seconds, setSeconds] = useState(readToday)
++  const lastTick = useRef(Date.now())
++
++  useEffect(() => {
++    const tick = () => {
++      if (document.visibilityState !== 'visible') return
++      const now = Date.now()
++      const delta = Math.min(30, Math.round((now - lastTick.current) / 1000))
++      lastTick.current = now
++      setSeconds((prev) => {
++        const next = prev + delta
++        writeToday(next)
++        return next
++      })
++    }
++    lastTick.current = Date.now()
++    const interval = setInterval(tick, 15000)
++    document.addEventListener('visibilitychange', tick)
++    return () => {
++      clearInterval(interval)
++      document.removeEventListener('visibilitychange', tick)
++    }
++  }, [])
++
++  return { minutesToday: Math.floor(seconds / 60) }
++}

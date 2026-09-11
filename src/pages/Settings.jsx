@@ -153,17 +153,7 @@ export default function Settings() {
             sub="Push, email and in-app alerts"
             onClick={() => navigate('/settings/notifications')}
           />
-          <Row
-            icon={Sparkles}
-            label="Feed & recommendations"
-            onClick={() =>
-              comingSoon('Feed & recommendations', 'Control what shows up in your feed and why.', [
-                'See fewer posts like this',
-                'Prioritize people you interact with most',
-                'Reset your recommendations',
-              ])
-            }
-          />
+          <Row icon={Sparkles} label="Feed & recommendations" onClick={() => navigate('/settings/feed')} />
           <Row icon={Star} label="Following & favorites" sub="Manage who you follow" onClick={() => navigate('/profile/following')} />
           <Row
             icon={Tag}
@@ -181,44 +171,19 @@ export default function Settings() {
         </Group>
 
         <Group emoji="⏱️" title="Your Time">
-          <Row
-            icon={Clock}
-            label="Time management"
-            onClick={() =>
-              comingSoon('Time management', 'See your daily usage and set reminders or quiet hours.', [
-                'Daily time-spent summary',
-                'Reminders after a set amount of time',
-                'Scheduled quiet hours',
-              ])
-            }
-          />
+          <Row icon={Clock} label="Time management" onClick={() => navigate('/settings/time')} />
           <Row
             icon={Moon}
             label="Focus mode"
             onClick={() => navigate('/settings/focus')}
           />
-          <Row
-            icon={BarChart2}
-            label="Your activity insights"
-            onClick={() =>
-              comingSoon('Your activity insights', 'Time spent, interaction patterns and usage trends over time.', [])
-            }
-          />
+          <Row icon={BarChart2} label="Your activity insights" onClick={() => navigate('/settings/time')} />
         </Group>
 
         <Group emoji="👥" title="Your Connections">
           <Row icon={UserCheck} label="Following" sub="Accounts you follow" onClick={() => navigate('/profile/following')} />
           <Row icon={Users} label="Followers" sub="People who follow you" onClick={() => navigate('/profile/followers')} />
-          <Row
-            icon={HeartHandshake}
-            label="Close friends"
-            onClick={() =>
-              comingSoon('Close friends', 'Choose who gets special access to your close-friends-only content.', [
-                'Build your close friends list',
-                'Share posts and stories to it only',
-              ])
-            }
-          />
+          <Row icon={HeartHandshake} label="Close friends" onClick={() => navigate('/settings/close-friends')} />
           <Row
             icon={ShieldOff}
             label="Blocked accounts"
@@ -241,16 +206,7 @@ export default function Settings() {
             onClick={() => navigate('/settings/privacy')}
           />
           <Row icon={KeyRound} label="Security" sub="Change your password" onClick={() => navigate('/settings/password')} />
-          <Row
-            icon={ShieldAlert}
-            label="Account protection"
-            onClick={() =>
-              comingSoon('Account protection', 'Suspicious-activity alerts and account recovery options.', [
-                'Login alerts for new devices',
-                'Recovery email/phone',
-              ])
-            }
-          />
+          <Row icon={ShieldAlert} label="Account protection" sub="See your login activity" onClick={() => navigate('/settings/login-activity')} />
           <Row
             icon={SlidersHorizontal}
             label="Content controls"
@@ -271,18 +227,14 @@ export default function Settings() {
             label="Payments"
             onClick={() => comingSoon('Payments', 'Payment methods, purchases, subscriptions and transaction history.', [])}
           />
-          <Row
-            icon={Megaphone}
-            label="Ads & preferences"
-            onClick={() => comingSoon('Ads & preferences', 'Ad topics, personalization and advertising controls.', [])}
-          />
+          <Row icon={Megaphone} label="Ads & preferences" onClick={() => navigate('/settings/ads')} />
           <Row
             icon={Wand2}
             label="Creator tools"
             onClick={() =>
               comingSoon(
                 'Creator tools',
-                'Monetization, subscriptions and branded-content tools — schema-ready on the backend, not yet surfaced in the app.',
+                'Monetization, subscriptions and branded-content tools — needs a payment processor connected before payouts can be real.',
                 []
               )
             }
@@ -290,7 +242,7 @@ export default function Settings() {
           <Row
             icon={LayoutDashboard}
             label="Professional dashboard"
-            onClick={() => comingSoon('Professional dashboard', 'Performance, audience and content tools for creators and businesses.', [])}
+            onClick={() => navigate('/settings/insights/overview')}
           />
           <Row
             icon={Briefcase}
@@ -307,27 +259,9 @@ export default function Settings() {
         </Group>
 
         <Group emoji="🛠️" title="Tools & Support">
-          <Row
-            icon={Eye}
-            label="Accessibility"
-            onClick={() =>
-              comingSoon('Accessibility', 'Screen reader, captions, motion and contrast options.', [
-                'Reduce motion',
-                'Increase contrast',
-                'Screen-reader friendly labels app-wide',
-              ])
-            }
-          />
-          <Row
-            icon={Database}
-            label="Data usage"
-            onClick={() => comingSoon('Data usage', 'Media quality, downloads and data-saving controls.', [])}
-          />
-          <Row
-            icon={Smartphone}
-            label="App & device"
-            onClick={() => comingSoon('App & device', 'App behavior, connected devices and device permissions.', [])}
-          />
+          <Row icon={Eye} label="Accessibility" onClick={() => navigate('/settings/accessibility')} />
+          <Row icon={Database} label="Data usage" onClick={() => navigate('/settings/data-usage')} />
+          <Row icon={Smartphone} label="App & device" sub="Where you're logged in" onClick={() => navigate('/settings/login-activity')} />
           <Row icon={HelpCircle} label="Help & support" onClick={() => navigate('/settings/help')} />
           <Row icon={Info} label="About" sub="Version, Privacy Policy, Terms" onClick={() => navigate('/settings/about')} />
         </Group>
