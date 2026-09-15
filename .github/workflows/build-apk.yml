@@ -43,8 +43,16 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          yes | sdkmanager --licenses || true
+          set -e
+
+          sdkmanager --sdk_root="$ANDROID_HOME" "cmdline-tools;latest"
+
+          yes | sdkmanager \
+            --sdk_root="$ANDROID_HOME" \
+            --licenses || true
+
           sdkmanager \
+            --sdk_root="$ANDROID_HOME" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
@@ -71,7 +79,7 @@ jobs:
 
             echo "Release signing configured from repo secrets."
           else
-            echo "::warning::RELEASE_KEYSTORE_BASE64 is not set. Building without release signing configuration."
+            echo "::warning::RELEASE_KEYSTORE_BASE64 is not set."
           fi
 
       - name: Build release APK
