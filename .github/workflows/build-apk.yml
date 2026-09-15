@@ -39,29 +39,30 @@ jobs:
           java-version: "21"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK components
         run: |
           set -e
           
-          # Update SDK manager first
-          sdkmanager --sdk_root="$ANDROID_HOME" --update
+          # Create ANDROID_HOME directory structure
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          mkdir -p "$ANDROID_HOME/licenses"
           
-          # Install cmdline-tools explicitly
-          sdkmanager --sdk_root="$ANDROID_HOME" "cmdline-tools;latest" || true
+          # Download and install cmdline-tools
+          cd /tmp
+          wget https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -q
+          unzip -q commandlinetools-linux-9477386_latest.zip
+          mv cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          cd "$ANDROID_HOME/cmdline-tools/latest/bin"
           
-          # Accept all licenses
-          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses || true
+          # Accept licenses
+          yes | ./sdkmanager --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1 || true
           
-          # Install required components with retries
-          sdkmanager \
-            --sdk_root="$ANDROID_HOME" \
+          # Install required SDK components
+          ./sdkmanager --sdk_root="$ANDROID_HOME" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125" \
-            "cmake;3.22.1" || echo "Some components may have failed, continuing..."
+            "cmake;3.22.1" || echo "Warning: Some components may have failed"
 
       - name: Make gradlew executable
         run: chmod +x android/android/gradlew
