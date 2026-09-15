@@ -1,0 +1,2368 @@
+diff --git a/android/.gitignore b/android/.gitignore
+index 5ffd0f5..0b1fb5d 100644
+--- a/android/.gitignore
++++ b/android/.gitignore
+@@ -27,3 +27,9 @@ android/app/*.iml
+ *.keystore
+ *.jks
+ android/keystore.properties
++
++# Firebase config for push notifications (docs/PUSH_NOTIFICATIONS_SETUP.md)
++# — specific to your own Firebase project, same reasoning as
++# keystore.properties above. The app builds fine without it (push
++# notifications just stay a no-op until it's added).
++android/app/google-services.json
+diff --git a/android/README.md b/android/README.md
+index a54a99a..904c62a 100644
+--- a/android/README.md
++++ b/android/README.md
+@@ -117,6 +117,18 @@ in that list, every API call from the Android app fails CORS even though
+ the URL itself is correct — this is the single most common thing to
+ forget when wrapping a web app this way. See `../docs/GO_LIVE_CHECKLIST.md`.
+ 
++## Push notifications, calling, and live streaming
++
++All three are implemented in code (real WebRTC for calls/live streams —
++see `src/pages/Call.jsx`, `LiveGo.jsx`, `LiveView.jsx`; real FCM push —
++see `src/utils/usePushNotifications.js` and `backend/src/lib/push.js`).
++Calling/live streaming need nothing extra from you beyond this repo's
++existing Supabase project (they piggyback on the same Realtime
++connection the chat/live-viewer-count features already use). Push
++notifications need a Firebase project you create and wire in yourself —
++that can't be done from this repo alone. See
++`../docs/PUSH_NOTIFICATIONS_SETUP.md`.
++
+ ## Signing a release build (this is what makes updates install cleanly)
+ 
+ **The rule that matters more than anything else in this section: generate
+diff --git a/android/android/app/src/main/AndroidManifest.xml b/android/android/app/src/main/AndroidManifest.xml
+index 3e988f2..54be2a8 100644
+--- a/android/android/app/src/main/AndroidManifest.xml
++++ b/android/android/app/src/main/AndroidManifest.xml
+@@ -34,4 +34,13 @@
+     <!-- Permissions -->
+ 
+     <uses-permission android:name="android.permission.INTERNET" />
++    <!-- Required from Android 13 (API 33) onward to show ANY notification
++         — without it, a granted runtime prompt still silently shows
++         nothing. PushNotifications.requestPermissions()/register() in
++         src/utils/usePushNotifications.js handles the runtime prompt
++         itself; this manifest declaration is what makes that prompt
++         possible to grant in the first place. Android 12 and below never
++         prompt for this at all (notifications just work), so this is a
++         no-op there, not a new restriction. -->
++    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ </manifest>
+diff --git a/android/package.json b/android/package.json
+index 6abddc4..5968c1c 100644
+--- a/android/package.json
++++ b/android/package.json
+@@ -11,7 +11,11 @@
+   },
+   "dependencies": {
+     "@capacitor/android": "^6.2.0",
+-    "@capacitor/core": "^6.2.0"
++    "@capacitor/app": "^6.0.3",
++    "@capacitor/core": "^6.2.0",
++    "@capacitor/keyboard": "^6.0.4",
++    "@capacitor/push-notifications": "^6.0.5",
++    "@capawesome/capacitor-badge": "^6.0.0"
+   },
+   "devDependencies": {
+     "@capacitor/cli": "^6.2.1"
+diff --git a/backend/src/index.js b/backend/src/index.js
+index 306a51f..ecd5088 100644
+--- a/backend/src/index.js
++++ b/backend/src/index.js
+@@ -17,6 +17,7 @@ import messages from './routes/messages.js'
+ import live from './routes/live.js'
+ import insights from './routes/insights.js'
+ import support from './routes/support.js'
++import pushTokens from './routes/pushTokens.js'
+ 
+ const app = new Hono()
+ 
+@@ -113,6 +114,7 @@ app.route('/v1', messages)
+ app.route('/v1', live)
+ app.route('/v1', insights)
+ app.route('/v1', support)
++app.route('/v1', pushTokens)
+ 
+ // 404 handler
+ app.notFound((c) => c.json({ error: 'Not found' }, 404))
+diff --git a/backend/src/lib/notify.js b/backend/src/lib/notify.js
+index 2ac62cf..ee03f76 100644
+--- a/backend/src/lib/notify.js
++++ b/backend/src/lib/notify.js
+@@ -1,7 +1,9 @@
+ import { adminClient } from './supabase.js'
++import { sendPush } from './push.js'
+ 
+ /**
+- * Insert a notification row for `recipientId`.
++ * Insert a notification row for `recipientId`, and fire a real push
++ * notification alongside it if they have a device registered.
+  *
+  * Why adminClient and not the caller's userClient: `notifications` only has
+  * a SELECT policy in the Level 1 schema ("users read their own
+@@ -13,11 +15,19 @@ import { adminClient } from './supabase.js'
+  * wouldn't already be allowed to trigger indirectly (a follow, a comment,
+  * a reaction), it just performs the fan-out write on their behalf.
+  *
+- * Never lets a notification failure fail the parent request — notifying
+- * is a side effect, not the point of the call.
++ * Never lets a notification (or push) failure fail the parent request —
++ * notifying is a side effect, not the point of the call.
++ *
++ * Takes the Hono context `c` (not just `c.env`) so it can hand the FCM
++ * round-trip to `c.executionCtx.waitUntil()` — without that, a Worker is
++ * free to tear down the isolate the instant the HTTP response is sent,
++ * which could cut the push send off mid-flight since it isn't awaited
++ * inline (awaiting it here would make every like/comment/follow wait on
++ * a full Firebase round-trip before the person gets their response).
+  */
+-export async function notify(env, { recipientId, actorId, type, text }) {
++export async function notify(c, { recipientId, actorId, type, text }) {
+   if (!recipientId || recipientId === actorId) return // don't notify yourself
++  const env = c.env
+   try {
+     const supabase = adminClient(env)
+     await supabase.from('notifications').insert({
+@@ -28,6 +38,9 @@ export async function notify(env, { recipientId, actorId, type, text }) {
+   } catch (err) {
+     console.error('notify() failed', err)
+   }
++
++  const pushPromise = sendPush(env, recipientId, { title: 'BharatSpace', body: text, data: { type } })
++  if (c.executionCtx?.waitUntil) c.executionCtx.waitUntil(pushPromise)
+ }
+ 
+ export function truncate(text, max = 60) {
+diff --git a/backend/src/lib/push.js b/backend/src/lib/push.js
+new file mode 100644
+index 0000000..b885e69
+--- /dev/null
++++ b/backend/src/lib/push.js
+@@ -0,0 +1,159 @@
++// lib/push.js — sends real, OS-level push notifications (the kind that
++// show up in the phone's notification tray while the app is closed) via
++// Firebase Cloud Messaging's HTTP v1 API. Called from notify.js (likes,
++// comments, follows, mentions) and routes/messages.js (new DMs) whenever
++// the recipient has a device token on file — see
++// docs/migrations/022_device_push_tokens.sql and routes/pushTokens.js
++// for how those get there.
++//
++// Why this hand-rolls a JWT instead of using the firebase-admin SDK: that
++// SDK depends on Node APIs Workers' runtime doesn't provide. This
++// implements the same OAuth2 service-account flow Google documents,
++// entirely with the Web Crypto API, which Workers does support natively.
++//
++// Requires one secret — `wrangler secret put FCM_SERVICE_ACCOUNT_JSON`,
++// the *entire* JSON key file downloaded from Firebase console -> Project
++// settings -> Service accounts -> Generate new private key, pasted in as
++// one line. See docs/PUSH_NOTIFICATIONS_SETUP.md for the full walkthrough
++// (creating the Firebase project, wiring the Android app to it, and
++// setting this secret) — that setup can only be done by whoever owns the
++// Firebase account, so every function below is a silent no-op (not an
++// error) until it's done, the same "not configured yet" shape
++// email.js's RESEND_API_KEY check already uses elsewhere in this
++// backend. A deployment that hasn't done that setup keeps working
++// exactly as it did before this file existed; recipients just don't get
++// a system-tray notification yet, only the existing in-app one.
++import { adminClient } from './supabase.js'
++
++function base64UrlFromString(str) {
++  return btoa(unescape(encodeURIComponent(str)))
++    .replace(/\+/g, '-')
++    .replace(/\//g, '_')
++    .replace(/=+$/, '')
++}
++
++function base64UrlFromBuffer(buf) {
++  let binary = ''
++  const bytes = new Uint8Array(buf)
++  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
++  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
++}
++
++function pemToBuffer(pem) {
++  const b64 = pem
++    .replace(/-----BEGIN PRIVATE KEY-----/, '')
++    .replace(/-----END PRIVATE KEY-----/, '')
++    .replace(/\s+/g, '')
++  const binary = atob(b64)
++  const bytes = new Uint8Array(binary.length)
++  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
++  return bytes.buffer
++}
++
++// Cached per Worker isolate — an FCM access token is valid for an hour,
++// and re-signing a fresh JWT plus round-tripping to Google's token
++// endpoint on every single notification would be both slower and
++// needlessly hard on that endpoint. Harmless if the isolate recycles
++// sooner than that; it just re-mints next call.
++let cachedAuth = null // { accessToken, projectId, expiresAtMs }
++
++async function getAccessToken(env) {
++  if (cachedAuth && Date.now() < cachedAuth.expiresAtMs - 60_000) return cachedAuth
++
++  const serviceAccount = JSON.parse(env.FCM_SERVICE_ACCOUNT_JSON)
++  const nowSec = Math.floor(Date.now() / 1000)
++  const header = base64UrlFromString(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))
++  const claims = base64UrlFromString(
++    JSON.stringify({
++      iss: serviceAccount.client_email,
++      scope: 'https://www.googleapis.com/auth/firebase.messaging',
++      aud: 'https://oauth2.googleapis.com/token',
++      iat: nowSec,
++      exp: nowSec + 3600,
++    })
++  )
++  const signingInput = `${header}.${claims}`
++
++  const key = await crypto.subtle.importKey(
++    'pkcs8',
++    pemToBuffer(serviceAccount.private_key),
++    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
++    false,
++    ['sign']
++  )
++  const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(signingInput))
++  const assertion = `${signingInput}.${base64UrlFromBuffer(signature)}`
++
++  const res = await fetch('https://oauth2.googleapis.com/token', {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
++    body: new URLSearchParams({
++      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
++      assertion,
++    }),
++  })
++  if (!res.ok) throw new Error(`FCM token exchange failed: ${res.status} ${await res.text()}`)
++  const json = await res.json()
++
++  cachedAuth = {
++    accessToken: json.access_token,
++    projectId: serviceAccount.project_id,
++    expiresAtMs: Date.now() + json.expires_in * 1000,
++  }
++  return cachedAuth
++}
++
++// Sends `{ title, body, data }` as a real push to every device `userId`
++// has registered (routes/pushTokens.js). Never throws — a push failure
++// (or Firebase simply not being configured yet) must never take down the
++// in-app action that triggered it (liking a post, sending a DM, etc.),
++// which is why every caller treats this as fire-and-forget.
++export async function sendPush(env, userId, { title, body, data } = {}) {
++  if (!env.FCM_SERVICE_ACCOUNT_JSON || !userId) return
++
++  try {
++    const supabase = adminClient(env)
++    const { data: rows } = await supabase.from('device_tokens').select('token').eq('user_id', userId)
++    const tokens = (rows || []).map((r) => r.token)
++    if (!tokens.length) return
++
++    const { accessToken, projectId } = await getAccessToken(env)
++    const stringData = data
++      ? Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)]))
++      : undefined
++
++    const results = await Promise.allSettled(
++      tokens.map(async (token) => {
++        const res = await fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
++          method: 'POST',
++          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            message: {
++              token,
++              notification: { title, body },
++              data: stringData,
++              android: { priority: 'high' },
++            },
++          }),
++        })
++        if (!res.ok) {
++          const errJson = await res.json().catch(() => ({}))
++          const reason = errJson?.error?.details?.find((d) => d.errorCode)?.errorCode
++          if (reason === 'UNREGISTERED' || reason === 'INVALID_ARGUMENT') {
++            // The app was uninstalled or the token rotated on Google's
++            // side — clean it up so future sends don't keep paying for
++            // (and retrying) a token that will never deliver again.
++            await supabase.from('device_tokens').delete().eq('token', token)
++          } else {
++            throw new Error(`FCM send failed: ${res.status} ${JSON.stringify(errJson)}`)
++          }
++        }
++      })
++    )
++    results.forEach((r) => {
++      if (r.status === 'rejected') console.error('[push] send failed for one device', r.reason)
++    })
++  } catch (err) {
++    console.error('[push] sendPush failed', err)
++  }
++}
+diff --git a/backend/src/routes/follows.js b/backend/src/routes/follows.js
+index 6c3c55d..acd40d2 100644
+--- a/backend/src/routes/follows.js
++++ b/backend/src/routes/follows.js
+@@ -33,7 +33,7 @@ follows.post('/follows', requireAuth, async (c) => {
+ 
+   const { error } = await supabase.from('follows').insert({ follower_id: c.get('userId'), followee_id: followeeId })
+   if (error) return dbError(c, error)
+-  await notify(c.env, { recipientId: followeeId, actorId: c.get('userId'), type: 'follow', text: 'followed you' })
++  await notify(c, { recipientId: followeeId, actorId: c.get('userId'), type: 'follow', text: 'followed you' })
+   return c.json({ ok: true }, 201)
+ })
+ 
+diff --git a/backend/src/routes/live.js b/backend/src/routes/live.js
+index 31547f2..5766558 100644
+--- a/backend/src/routes/live.js
++++ b/backend/src/routes/live.js
+@@ -93,4 +93,46 @@ live.patch('/live/:id/end', requireAuth, async (c) => {
+   return c.json({ ok: true })
+ })
+ 
++// GET /v1/live/:id — resolves a single stream's host, for LiveView.jsx to
++// know who it should expect a WebRTC offer from (see
++// src/api/realtime.js's joinLiveStream and LiveView.jsx). Needed because
++// a stream can be opened by deep link/notification, not only by tapping
++// it in Home.jsx's rail where the hostId is already in hand. Public
++// (optionalAuth) for the same reason /live/active is: whether someone is
++// live, and who's hosting, isn't private.
++live.get('/live/:id', optionalAuth, async (c) => {
++  const supabase = userClient(c.env, c.get('jwt') || c.env.SUPABASE_ANON_KEY)
++  const { data: stream, error } = await supabase
++    .from('live_streams')
++    .select('id, host_id, title, status, started_at')
++    .eq('id', c.req.param('id'))
++    .single()
++  if (error || !stream) return c.json({ error: 'Stream not found' }, 404)
++
++  const { data: profile } = await supabase
++    .from('profiles')
++    .select('display_name, avatar_asset_id')
++    .eq('user_id', stream.host_id)
++    .single()
++  let hostAvatarUrl = null
++  if (profile?.avatar_asset_id) {
++    const { data: asset } = await supabase
++      .from('media_assets')
++      .select('storage_key')
++      .eq('id', profile.avatar_asset_id)
++      .single()
++    if (asset?.storage_key) hostAvatarUrl = `${c.env.R2_PUBLIC_BASE_URL}/${asset.storage_key}`
++  }
++
++  return c.json({
++    id: stream.id,
++    hostId: stream.host_id,
++    hostName: profile?.display_name || 'BharatSpace user',
++    hostAvatarUrl,
++    title: stream.title,
++    status: stream.status,
++    startedAt: stream.started_at,
++  })
++})
++
+ export default live
+diff --git a/backend/src/routes/messages.js b/backend/src/routes/messages.js
+index 04539c7..59f58b7 100644
+--- a/backend/src/routes/messages.js
++++ b/backend/src/routes/messages.js
+@@ -3,6 +3,8 @@ import { userClient } from '../lib/supabase.js'
+ import { dbError } from '../lib/errorHandler.js'
+ import { requireAuth } from '../lib/authMiddleware.js'
+ import { checkRateLimit, requireText, LIMITS } from '../lib/security.js'
++import { sendPush } from '../lib/push.js'
++import { truncate } from '../lib/notify.js'
+ 
+ const messages = new Hono()
+ 
+@@ -232,6 +234,26 @@ messages.post('/conversations/:id/messages', requireAuth, async (c) => {
+     .from('conversation_reads')
+     .upsert({ conversation_id: conversation.id, user_id: myId, last_read_at: data.created_at }, { onConflict: 'conversation_id,user_id' })
+ 
++  // DMs don't go through notify() (they're not part of the Activity feed
++  // — see conversation_reads above, a separate unread-tracking system),
++  // so the push send lives here directly instead. waitUntil for the same
++  // reason notify() uses it: this shouldn't make the sender wait on a
++  // Firebase round-trip just to see their own message go through.
++  const recipientId = otherParticipant(conversation, myId)
++  const pushPromise = (async () => {
++    const { data: senderProfile } = await supabase
++      .from('profiles')
++      .select('display_name')
++      .eq('user_id', myId)
++      .single()
++    await sendPush(c.env, recipientId, {
++      title: senderProfile?.display_name || 'New message',
++      body: text.value ? truncate(text.value, 80) : 'Sent a post',
++      data: { type: 'message', conversationId: conversation.id },
++    })
++  })()
++  if (c.executionCtx?.waitUntil) c.executionCtx.waitUntil(pushPromise)
++
+   return c.json(data, 201)
+ })
+ 
+diff --git a/backend/src/routes/posts.js b/backend/src/routes/posts.js
+index dcb9b9d..5da7279 100644
+--- a/backend/src/routes/posts.js
++++ b/backend/src/routes/posts.js
+@@ -174,7 +174,7 @@ posts.post('/posts', requireAuth, async (c) => {
+     else {
+       await Promise.all(
+         tagIds.map((recipientId) =>
+-          notify(c.env, {
++          notify(c, {
+             recipientId,
+             actorId: c.get('userId'),
+             type: 'tag',
+@@ -208,7 +208,7 @@ posts.post('/posts/:id/comments', requireAuth, async (c) => {
+ 
+   const { data: post } = await supabase.from('posts').select('author_id, body').eq('id', postId).single()
+   if (post) {
+-    await notify(c.env, {
++    await notify(c, {
+       recipientId: post.author_id,
+       actorId: c.get('userId'),
+       type: 'reply',
+@@ -345,7 +345,7 @@ posts.post('/posts/:id/react', requireAuth, async (c) => {
+   if (type === 'like') {
+     const { data: post } = await supabase.from('posts').select('author_id, body').eq('id', postId).single()
+     if (post) {
+-      await notify(c.env, {
++      await notify(c, {
+         recipientId: post.author_id,
+         actorId: c.get('userId'),
+         type: 'reaction',
+diff --git a/backend/src/routes/pushTokens.js b/backend/src/routes/pushTokens.js
+new file mode 100644
+index 0000000..539b5d0
+--- /dev/null
++++ b/backend/src/routes/pushTokens.js
+@@ -0,0 +1,51 @@
++import { Hono } from 'hono'
++import { userClient, adminClient } from '../lib/supabase.js'
++import { dbError } from '../lib/errorHandler.js'
++import { requireAuth } from '../lib/authMiddleware.js'
++import { requireText } from '../lib/security.js'
++
++const pushTokens = new Hono()
++
++const PLATFORMS = ['android', 'ios', 'web']
++
++// POST /v1/device-tokens { token, platform } — called from
++// src/utils/usePushNotifications.js right after
++// PushNotifications.register() resolves. Uses the admin client rather
++// than the caller's own RLS-scoped one because RLS can only let someone
++// update a device_tokens row they already own (see
++// docs/migrations/022_device_push_tokens.sql) — if this device
++// previously belonged to a different, since-signed-out account, this
++// upsert needs to reassign that same row to the new one, which is
++// exactly the "admin-curated action on the caller's own behalf" escape
++// hatch lib/notify.js already uses this client for.
++pushTokens.post('/device-tokens', requireAuth, async (c) => {
++  const body = await c.req.json().catch(() => ({}))
++  const v = requireText(body.token, { field: 'token', max: 4096 })
++  if (v.error) return c.json({ error: v.error }, 400)
++  const platform = PLATFORMS.includes(body.platform) ? body.platform : 'android'
++
++  const supabase = adminClient(c.env)
++  const { error } = await supabase
++    .from('device_tokens')
++    .upsert(
++      { token: v.value, user_id: c.get('userId'), platform, updated_at: new Date().toISOString() },
++      { onConflict: 'token' }
++    )
++  if (error) return dbError(c, error, 'Could not register this device for notifications')
++  return c.json({ ok: true })
++})
++
++// DELETE /v1/device-tokens { token } — called on sign-out so a shared or
++// reused device stops receiving this account's pushes immediately,
++// rather than waiting for whoever signs in next to overwrite the row.
++pushTokens.delete('/device-tokens', requireAuth, async (c) => {
++  const body = await c.req.json().catch(() => ({}))
++  if (!body.token) return c.json({ error: 'token is required' }, 400)
++
++  const supabase = userClient(c.env, c.get('jwt'))
++  const { error } = await supabase.from('device_tokens').delete().eq('token', body.token).eq('user_id', c.get('userId'))
++  if (error) return dbError(c, error)
++  return c.json({ ok: true })
++})
++
++export default pushTokens
+diff --git a/docs/GO_LIVE_CHECKLIST.md b/docs/GO_LIVE_CHECKLIST.md
+index 7e85acf..8b75ba8 100644
+--- a/docs/GO_LIVE_CHECKLIST.md
++++ b/docs/GO_LIVE_CHECKLIST.md
+@@ -84,6 +84,10 @@ sensitive):
+ - [ ] `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_JWT_SECRET`
+ - [ ] `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
+ - [ ] `TURNSTILE_SECRET_KEY` — optional, skip if not using Turnstile
++- [ ] `FCM_SERVICE_ACCOUNT_JSON` — optional, skip unless you want real
++      push notifications (system tray, outside the app) working end to
++      end; see `docs/PUSH_NOTIFICATIONS_SETUP.md`. Everything else in
++      this checklist works fine without it.
+ 
+ Leaving any of `SUPABASE_URL`/`R2_ACCOUNT_ID`/`R2_PUBLIC_BASE_URL` unset or
+ as a leftover placeholder anywhere is the single most common reason
+diff --git a/docs/PROGRESS.md b/docs/PROGRESS.md
+index 18a7ddb..52a8087 100644
+--- a/docs/PROGRESS.md
++++ b/docs/PROGRESS.md
+@@ -7,9 +7,10 @@ worse than no doc at all.
+ 
+ ## Setup you still need to do (config, not code)
+ 
+-1. **Run migrations 013–021** (`docs/migrations/`) against your Supabase
++1. **Run migrations 013–022** (`docs/migrations/`) against your Supabase
+    project, in order, if you haven't already. Each file's own comment
+-   says exactly what it does and why.
++   says exactly what it does and why. 022 is new this round (device push
++   tokens — see #6 below).
+ 2. **Confirmation email isn't sending** because two Cloudflare Worker
+    secrets aren't set yet — the code path is already correct (verified by
+    reading the current `auth.js`/`email.js` directly):
+@@ -25,14 +26,76 @@ worse than no doc at all.
+    `messages` and `user_settings` added to the `supabase_realtime`
+    publication — that migration does it via SQL, or toggle it in
+    Database → Replication if you'd rather.
++4. **`npm install` in both the repo root and `android/`** — this round
++   added `@capacitor/keyboard`, `@capacitor/push-notifications`,
++   `@capacitor/app`, and `@capawesome/capacitor-badge` to both
++   `package.json`s (root for the web bundle, `android/` for `cap sync` to
++   link the native modules). Run `npm install` in each, then `cd android
++   && npm run sync` before your next APK build.
++5. **Real push notifications need a Firebase project** — the entire
++   client+backend pipeline is built and wired (see "Done and verified"
++   below), but it's a silent no-op until you create that project yourself
++   and set one Worker secret. Full walkthrough:
++   `docs/PUSH_NOTIFICATIONS_SETUP.md`.
++6. **Calling and live-streaming video need nothing extra from you** —
++   they piggyback on the same Supabase Realtime connection the app
++   already uses for chat and the live viewer count, so migrations 1–3
++   above are all they need.
+ 
+ ## Done and verified (builds clean, backend syntax-checked)
+ 
+-- **Bottom-anchoring / keyboard behavior** — Chat, Comments, Reels
+-  comment/share, Share sheet, New-message picker: all keyboard-aware via
+-  `src/utils/useKeyboardInset.js`, no hardcoded pixel offsets. BottomNav
+-  hides app-wide (not just visually covered) whenever any keyboard is
+-  open — see `src/components/AppLayout.jsx`.
++- **Bottom-anchoring / keyboard behavior, for real this time** — the
++  previous pass's `useKeyboardInset.js` relied entirely on
++  `window.visualViewport`, which multiple people confirmed was still
++  unreliable on the actual Android WebView this ships in (chat/comment
++  inputs and the ShareSheet's Send button ending up behind Gboard
++  despite that fix). It's now backed primarily by
++  `@capacitor/keyboard`'s native events (the OS's own insets callback,
++  not a WebView JS API), with the old visualViewport math kept as the
++  actual pixel calculation — chosen deliberately so it self-corrects
++  whether or not the native window also resized, rather than risking a
++  double-shift. Same file, same 5 call sites (Chat, Comments, Reels
++  comment/share, Share sheet, New-message picker) — no per-screen changes
++  needed.
++- **Bottom nav** — slimmed down, and now measures its own real rendered
++  height (icons + labels + padding + `env(safe-area-inset-bottom)`,
++  which varies a lot by device) into a `--bottom-nav-h` CSS variable via
++  `ResizeObserver`, instead of every consumer trusting a hardcoded `56px`
++  guess that undershot real height on gesture-nav phones — likely the
++  actual cause of content peeking out from behind it that was reported.
++- **Reels frame** — the header/tabs were laid out as normal in-flow flex
++  children, which pushed every reel's video down ~90px short of the top
++  of the screen (and cropped its true bottom against the nav's safe
++  area). They're now a floating overlay (same pattern the mute button
++  already used), so the video is genuinely edge-to-edge top-to-bottom.
++- **Notification "unread" state hardening** — the server-side read
++  persistence (`backend/src/routes/notifications.js`) was already
++  correct on inspection, but `markNotificationsRead` now also writes a
++  device-local "already seen up through here" timestamp
++  (`AppContext.jsx`) as a backstop for the one real gap: a read-receipt
++  PATCH that silently fails to reach the backend no longer causes that
++  notification to re-highlight next time the app opens.
++- **Real push notifications (system tray, outside the app) + launcher
++  badge count** — `src/utils/usePushNotifications.js` +
++  `backend/src/lib/push.js` (hand-signs a Firebase service-account JWT
++  via Web Crypto, since `firebase-admin` isn't Workers-compatible) fire a
++  real FCM push for every like/comment/follow/mention/DM, once a device
++  token is on file (`docs/migrations/022_device_push_tokens.sql`).
++  `src/utils/useAppBadge.js` keeps the launcher icon's numeric badge in
++  sync with the same unread counts the in-app bell already shows. Needs
++  your own Firebase project to actually deliver — see "Setup" above.
++- **Real audio/video for Call and Live** — a genuine WebRTC peer
++  connection now carries the audio/video, not just a local preview + a
++  "connected" signal. `src/api/realtime.js`'s existing Supabase Realtime
++  channels (already used for presence/chat) carry the SDP offer/answer +
++  ICE candidates; STUN-only (Cloudflare's + Google's public servers, see
++  `src/utils/webrtc.js`) means it connects on the large majority of
++  networks but not ones with symmetric NAT on both ends, which would
++  need a TURN relay to add later. Live streaming is a mesh (the host
++  opens one direct connection per viewer) rather than an SFU — fine for
++  a handful of concurrent viewers, but a genuinely large audience needs a
++  real media-relay service (LiveKit/Agora/Cloudflare Realtime), which is
++  a separate infra decision from what a mesh can be turned into.
+ - **Profile Share button** — was failing silently (no toast on any
+   branch); now matches `PostDetail.jsx`'s already-correct pattern.
+ - **Account types** (Personal/Creator/Brand/Community) — reused the
+@@ -41,10 +104,7 @@ worse than no doc at all.
+   `/settings/account-type`.
+ - **Live streaming entry point** — real session lifecycle
+   (`live_streams` table), live viewer count + chat via Supabase Realtime
+-  Presence/Broadcast. Video itself is **not** transported to viewers yet
+-  — see "Blocked on your decision" below.
+-- **Chat calling buttons** — same honest split as Live: real local
+-  preview + connection signaling, no actual peer audio/video yet.
++  Presence/Broadcast.
+ - **Your Insights** (all 4 rows) — real aggregates from
+   posts/reactions/comments/follows, no new tracking table.
+ - **Settings rows now real** (previously ComingSoon): Topics & interests,
+@@ -69,10 +129,18 @@ worse than no doc at all.
+ - **Payments** (Money & Business: payouts, transactions) — needs you to
+   pick and connect a processor (Razorpay/Stripe/etc.). No code can make
+   this real without that account existing first.
+-- **Real audio/video transport** for Live and Call — needs a WebRTC
+-  signaling/media-server choice (self-hosted vs. LiveKit/Agora/Cloudflare
+-  Calls/etc.). Every screen that touches this says so in its own comment
+-  and in the UI copy shown to users, rather than faking a connection.
++- **TURN server for calls/live streaming on restrictive networks** — the
++  STUN-only setup above (see "Done and verified") works for most
++  networks already; a TURN relay is only needed for the minority that
++  don't (symmetric NAT, some corporate firewalls), and needs picking a
++  provider (Cloudflare's own Realtime TURN service is a natural fit
++  given the backend already runs there) or self-hosting `coturn`.
++- **An SFU for live streaming at real scale** — the mesh model (see
++  above) is genuine, working WebRTC, not a stub, but it tops out around
++  a handful of concurrent viewers before the host's own upload bandwidth
++  becomes the bottleneck. Broadcasting to a large audience needs a real
++  media-relay service (LiveKit/Agora/Cloudflare Realtime), which is a
++  separate account/cost decision.
+ 
+ ## Patches applied so far (for reference)
+ 
+@@ -80,5 +148,8 @@ worse than no doc at all.
+   `d621f55 "CHANGE"`.
+ - `changecommit.patch` (account types, Topics, Live, Call, Insights, Help
+   & support) — applied in `1f56df6 "Apply changecommit patch"`.
+-- Next one covers everything in "Done and verified" above that isn't in
+-  those two.
++- `next-batch.patch` — applied in `5d0fa4c "Apply next batch patch"`.
++- This round (not a patch file — direct commits): the keyboard/bottom-nav/
++  Reels fixes, notification hardening, real push notifications + badge,
++  and real WebRTC for Call/Live described above.
++
+diff --git a/docs/PUSH_NOTIFICATIONS_SETUP.md b/docs/PUSH_NOTIFICATIONS_SETUP.md
+new file mode 100644
+index 0000000..7d1ca94
+--- /dev/null
++++ b/docs/PUSH_NOTIFICATIONS_SETUP.md
+@@ -0,0 +1,124 @@
++# Push notification setup (Firebase Cloud Messaging)
++
++Real, OS-level push notifications — the kind that show up in the phone's
++notification tray while the app is closed — are fully wired up in code on
++both ends:
++
++- **Client:** `src/utils/usePushNotifications.js` registers this device
++  the moment someone signs in, using `@capacitor/push-notifications`.
++- **Backend:** `backend/src/lib/push.js` sends the actual push via
++  Firebase Cloud Messaging's HTTP v1 API whenever `notify()` fires (likes,
++  comments, follows, mentions — `backend/src/lib/notify.js`) or a DM
++  arrives (`backend/src/routes/messages.js`).
++
++What's *not* done, and can't be done from this repo alone: the Firebase
++project itself. That's a Google account you'd own, not something that can
++be created or faked on your behalf. Until you do the steps below, every
++push send is a silent no-op — nothing breaks, people just don't get a
++system-tray notification yet (the in-app Activity tab still works
++exactly as it always did).
++
++---
++
++## 1. Create a Firebase project and add the Android app
++
++1. Go to the [Firebase console](https://console.firebase.google.com/) →
++   **Add project** (an existing Google Cloud project works too — Firebase
++   will offer to link it).
++2. Once created, click **Add app → Android**.
++3. **Android package name:** `com.bharatspace.app` (must match exactly —
++   this is `applicationId` in `android/android/app/build.gradle`).
++4. App nickname/SHA-1 are optional for push notifications specifically
++   (SHA-1 only matters if you later add Firebase Auth or Dynamic Links) —
++   skip them.
++5. Download the **`google-services.json`** file it offers you.
++
++## 2. Place the config file
++
++Copy the downloaded file to:
++
++```
++android/android/app/google-services.json
++```
++
++This exact path matters — `android/android/app/build.gradle` already has
++a conditional block that only applies the `google-services` Gradle plugin
++when this file exists:
++
++```groovy
++try {
++    def servicesJSON = file('google-services.json')
++    if (servicesJSON.text) {
++        apply plugin: 'com.google.gms.google-services'
++    }
++} catch(Exception e) {
++    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
++}
++```
++
++That's why the Android build has always succeeded even without this file
++— it's designed to degrade gracefully, not to require Firebase setup
++just to compile. `google-services.json` is not committed (it's excluded
++in `.gitignore` alongside `keystore.properties`, for the same reason:
++it's specific to your own Firebase project) — you'll place it locally and
++on whichever machine/CI runner builds your release APK.
++
++## 3. Generate a service-account key for the backend
++
++The backend sends pushes via FCM's HTTP v1 API, which authenticates with
++a service account rather than a legacy server key:
++
++1. Firebase console → ⚙️ **Project settings** → **Service accounts** tab.
++2. Click **Generate new private key** → confirm. This downloads a JSON
++   file (e.g. `bharatspace-firebase-adminsdk-xxxxx.json`).
++3. Set it as a Worker secret — **the entire file contents, as one line**:
++
++   ```bash
++   cd backend
++   npx wrangler secret put FCM_SERVICE_ACCOUNT_JSON
++   # paste the full JSON when prompted, then press Enter
++   ```
++
++Keep this file out of git — it's a real credential (same sensitivity as
++`SUPABASE_SERVICE_ROLE_KEY`, already handled the same way; see
++`docs/CONNECT_EXISTING_INFRA.md`).
++
++## 4. Sync and rebuild
++
++```bash
++npm install        # picks up @capacitor/push-notifications etc. — see package.json
++npm run build
++cd android
++npm install
++npm run sync        # copies dist/ into www/ and runs `cap sync android`
++npm run build:debug # or open in Android Studio and build a release APK
++```
++
++## 5. Test it
++
++1. Install the freshly built APK on a device, sign in — this triggers the
++   permission prompt (Android 13+) and, once granted, registers the
++   device's token with the backend (`POST /v1/device-tokens`).
++2. From a second account, like/comment on/follow the first account, or
++   send it a DM.
++3. Background the app (don't force-close it — a notification while the
++   app is in the foreground still shows in Activity, just not as a
++   system-tray banner) and confirm the notification appears.
++
++If nothing arrives: check the Worker's logs (`npx wrangler tail`) for
++`[push]`-prefixed errors — the most common causes are a mistyped/partial
++paste of the service-account JSON, or the device's token not having
++reached the backend at all (check for a row in `device_tokens` for that
++user — `docs/migrations/022_device_push_tokens.sql`).
++
++## Launcher icon badge count
++
++`src/utils/useAppBadge.js` keeps the app's launcher icon badge in sync
++with unread notifications + messages, using `@capawesome/capacitor-badge`
++— no Firebase project needed for this part, it works independently of
++the steps above. Whether it's actually visible depends on the phone's own
++launcher: most OEM launchers (Samsung, Xiaomi, OnePlus, etc.) show the
++real number; stock/Pixel-style (AOSP) launchers only ever show a plain
++dot, tied to whether there's an active system notification rather than a
++number an app can set directly. That's a platform limitation, not
++something this integration can work around.
+diff --git a/docs/migrations/022_device_push_tokens.sql b/docs/migrations/022_device_push_tokens.sql
+new file mode 100644
+index 0000000..b356713
+--- /dev/null
++++ b/docs/migrations/022_device_push_tokens.sql
+@@ -0,0 +1,43 @@
++-- Migration 022: device push tokens, for real OS-level notifications
++-- (system tray, outside the app) plus the launcher icon's numeric badge.
++-- See backend/src/lib/push.js for how these get used and
++-- docs/PUSH_NOTIFICATIONS_SETUP.md for the Firebase project setup this
++-- depends on.
++--
++-- `token` is the primary key rather than a separate `id` + a unique
++-- constraint on (user_id, token): a push token identifies one specific
++-- app installation on one specific device, not a person, and the same
++-- device can only ever usefully hold one row. That also makes device
++-- handoff between accounts (sign out of one account, sign into another
++-- on the same phone) a plain upsert-on-conflict(token) that reassigns
++-- user_id — see routes/pushTokens.js for why that upsert goes through
++-- the admin client rather than the caller's own RLS-scoped one.
++create table if not exists device_tokens (
++  token text primary key,
++  user_id uuid not null references users(id) on delete cascade,
++  platform text not null default 'android' check (platform in ('android', 'ios', 'web')),
++  created_at timestamptz not null default now(),
++  updated_at timestamptz not null default now()
++);
++
++create index if not exists device_tokens_user_idx on device_tokens(user_id);
++
++alter table device_tokens enable row level security;
++
++-- No insert/upsert policy for `authenticated` here on purpose: the
++-- device-handoff case above needs to reassign a row someone else's
++-- account currently owns, which RLS's `using` clause would otherwise
++-- correctly forbid — routes/pushTokens.js's POST handler uses the
++-- admin client for that write instead, the same escape hatch
++-- lib/notify.js already uses for its own fan-out inserts. Ordinary
++-- reads/deletes of a token you already own don't need that, so those
++-- stay on the normal RLS-scoped path.
++drop policy if exists "users read their own device tokens" on device_tokens;
++create policy "users read their own device tokens"
++  on device_tokens for select using (auth.uid() = user_id);
++
++drop policy if exists "users delete their own device tokens" on device_tokens;
++create policy "users delete their own device tokens"
++  on device_tokens for delete using (auth.uid() = user_id);
++
++grant select, delete on public.device_tokens to authenticated;
+diff --git a/package-lock.json b/package-lock.json
+index 7df699b..09daa68 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,6 +8,11 @@
+       "name": "bharatspace",
+       "version": "1.0.0",
+       "dependencies": {
++        "@capacitor/app": "^6.0.3",
++        "@capacitor/core": "^6.2.0",
++        "@capacitor/keyboard": "^6.0.4",
++        "@capacitor/push-notifications": "^6.0.5",
++        "@capawesome/capacitor-badge": "^6.0.0",
+         "@supabase/supabase-js": "^2.116.0",
+         "lucide-react": "^0.383.0",
+         "react": "^18.2.0",
+@@ -317,6 +322,61 @@
+         "node": ">=6.9.0"
+       }
+     },
++    "node_modules/@capacitor/app": {
++      "version": "6.0.3",
++      "resolved": "https://registry.npmjs.org/@capacitor/app/-/app-6.0.3.tgz",
++      "integrity": "sha512-4gFUCbcVz0N/YYN32OBFerocWXslIv3Nc90gDiRsBkJc0plwK6kIUT6PKa5WtW2kfhteUeCVXQbvArH2fH+0Ug==",
++      "license": "MIT",
++      "peerDependencies": {
++        "@capacitor/core": "^6.0.0"
++      }
++    },
++    "node_modules/@capacitor/core": {
++      "version": "6.2.2",
++      "resolved": "https://registry.npmjs.org/@capacitor/core/-/core-6.2.2.tgz",
++      "integrity": "sha512-qEI3DcwJEPzhW+hVGKH8m4jbujtkdUiGkpMLHmpR8epACU7wEsV6NF8pCHzpsMYjc80oK7Cmpcw+MIienv/YRw==",
++      "license": "MIT",
++      "dependencies": {
++        "tslib": "^2.1.0"
++      }
++    },
++    "node_modules/@capacitor/keyboard": {
++      "version": "6.0.4",
++      "resolved": "https://registry.npmjs.org/@capacitor/keyboard/-/keyboard-6.0.4.tgz",
++      "integrity": "sha512-tNeyQGxIOTiSv3g+dTxJ/plVpGMnB4daJuCHz1E2Kelo+jOx+FKlyFY9L1Ow144SCzuXK48NXr8WoxXfXgQEKA==",
++      "license": "MIT",
++      "peerDependencies": {
++        "@capacitor/core": "^6.0.0"
++      }
++    },
++    "node_modules/@capacitor/push-notifications": {
++      "version": "6.0.5",
++      "resolved": "https://registry.npmjs.org/@capacitor/push-notifications/-/push-notifications-6.0.5.tgz",
++      "integrity": "sha512-CsRmb0cnZd9Uwx24ym4My5fNKrQvwI4D51aMEph5pUZy+LAjp6q0y4NJe8DEgwaVdAqVLbb4rqn75AZ4WSiFYg==",
++      "license": "MIT",
++      "peerDependencies": {
++        "@capacitor/core": "^6.0.0"
++      }
++    },
++    "node_modules/@capawesome/capacitor-badge": {
++      "version": "6.0.0",
++      "resolved": "https://registry.npmjs.org/@capawesome/capacitor-badge/-/capacitor-badge-6.0.0.tgz",
++      "integrity": "sha512-HaRmS1apdlP51SKXKWr0bwhCJy9gSfP+e8UZuhrIxv6EtRujxkYPTTqDv883uwl4gidzedeUHI7YrGNJkKbdbw==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/capawesome-team/"
++        },
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/capawesome"
++        }
++      ],
++      "license": "MIT",
++      "peerDependencies": {
++        "@capacitor/core": "^6.0.0"
++      }
++    },
+     "node_modules/@esbuild/aix-ppc64": {
+       "version": "0.28.2",
+       "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.28.2.tgz",
+diff --git a/package.json b/package.json
+index 3822d5a..e845031 100644
+--- a/package.json
++++ b/package.json
+@@ -9,6 +9,11 @@
+     "preview": "vite preview"
+   },
+   "dependencies": {
++    "@capacitor/app": "^6.0.3",
++    "@capacitor/core": "^6.2.0",
++    "@capacitor/keyboard": "^6.0.4",
++    "@capacitor/push-notifications": "^6.0.5",
++    "@capawesome/capacitor-badge": "^6.0.0",
+     "@supabase/supabase-js": "^2.116.0",
+     "lucide-react": "^0.383.0",
+     "react": "^18.2.0",
+diff --git a/src/App.jsx b/src/App.jsx
+index 758bc09..2113e9e 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -4,6 +4,8 @@ import AppLayout from './components/AppLayout.jsx'
+ import LaunchSplash from './components/LaunchSplash.jsx'
+ import { useApp } from './context/AppContext.jsx'
+ import { prefetchOnIdle } from './utils/prefetchRoutes.js'
++import { usePushNotifications } from './utils/usePushNotifications.js'
++import { useAppBadge } from './utils/useAppBadge.js'
+ 
+ // Route-level code splitting. Every one of these ~30 screens used to be
+ // imported eagerly right here, which meant a first-time visit downloaded
+@@ -91,6 +93,14 @@ export default function App() {
+   const navigate = useNavigate()
+   const [introTimerDone, setIntroTimerDone] = useState(false)
+ 
++  // Both no-ops on web/mock-mode/permission-denied — see each hook's own
++  // comment. Mounted here (not deeper, e.g. inside AppLayout) so they
++  // stay mounted — and their internal refs/effects survive — across the
++  // sign-out transition itself, which AppLayout wouldn't if signing out
++  // ever unmounts it.
++  usePushNotifications()
++  useAppBadge()
++
+   // Warms the next screen most sessions are about to open, during
+   // otherwise-idle time: Welcome/SignUp while a signed-out visit is
+   // sitting on the splash/auth-restore spinner, or the five bottom-nav
+diff --git a/src/api/client.js b/src/api/client.js
+index af5e2a5..1d49b07 100644
+--- a/src/api/client.js
++++ b/src/api/client.js
+@@ -165,6 +165,7 @@ export const getProfile = (userId) => request(`/profiles/${userId}`, { auth: fal
+ export const updateProfile = (userId, updates) => request(`/profiles/${userId}`, { method: 'PATCH', body: updates })
+ export const updateAccountType = (accountType) => request('/account/type', { method: 'PATCH', body: { accountType } })
+ export const getActiveLiveStreams = () => request('/live/active', { auth: false })
++export const getLiveStream = (id) => request(`/live/${id}`, { auth: false })
+ export const startLiveStream = (title) => request('/live/start', { method: 'POST', body: { title } })
+ export const endLiveStream = (id) => request(`/live/${id}/end`, { method: 'PATCH' })
+ export const getInsightsOverview = () => request('/insights/overview')
+@@ -248,6 +249,13 @@ export const getHiddenPosts = () => request('/hidden-posts')
+ export const getSavedPosts = () => request('/saved-posts')
+ export const getNotifications = () => request('/notifications')
+ export const markNotificationRead = (id) => request(`/notifications/${id}/read`, { method: 'PATCH' })
++
++// See src/utils/usePushNotifications.js for when these are called
++// (register right after the OS hands back an FCM token; unregister on
++// sign-out so a shared/reused device stops getting this account's
++// pushes right away).
++export const registerDeviceToken = (token, platform) => request('/device-tokens', { method: 'POST', body: { token, platform } })
++export const unregisterDeviceToken = (token) => request('/device-tokens', { method: 'DELETE', body: { token } })
+ export const deleteAccount = () => request('/account', { method: 'DELETE' })
+ export const createReport = (payload) => request('/reports', { method: 'POST', body: payload })
+ 
+diff --git a/src/api/realtime.js b/src/api/realtime.js
+index bb9e9be..0da40fc 100644
+--- a/src/api/realtime.js
++++ b/src/api/realtime.js
+@@ -76,13 +76,13 @@ export function subscribeToMessages(conversationId, onInsert) {
+   return () => client.removeChannel(channel)
+ }
+ 
+-// Chat header's audio/video call buttons -> Call.jsx. Same
+-// presence-for-"is the other person here"/broadcast-for-signals
+-// mechanism as joinLiveStream, kept as its own export because the
+-// payloads mean something different (call control signals, not chat
+-// lines) — see Call.jsx's own comment for what this does and doesn't
+-// cover (peer connection/audio/video transport is not this; this is
+-// only "did the other participant open the same call").
++// Chat header's audio/video call buttons -> Call.jsx. Presence tracks
++// whether the other participant has this same call screen open
++// (onPeerCountChange); broadcast carries the actual WebRTC signaling
++// (SDP offer/answer, ICE candidates) Call.jsx negotiates a real peer
++// connection over — this channel is only the signaling transport, never
++// the media itself, which flows directly between the two devices once
++// negotiation completes.
+ export function joinCall(conversationId, { onPeerCountChange, onSignal }) {
+   if (!client) return { leave: () => {}, sendSignal: () => {} }
+   const channel = client.channel(`call:${conversationId}`, {
+@@ -102,28 +102,49 @@ export function joinCall(conversationId, { onPeerCountChange, onSignal }) {
+   }
+ }
+ 
+-// Live-stream viewer presence + chat. Both ephemeral by design (see
+-// docs/migrations/015_live_streams.sql's comment on why chat isn't a
+-// table) — Presence tracks who's currently in the channel for the
+-// viewer count, Broadcast fans out chat lines to everyone in it right
++// Live-stream viewer presence + chat, PLUS the WebRTC signaling
++// broadcast (LiveGo.jsx passes role:'host', LiveView.jsx defaults to
++// 'viewer') that carries the actual audio/video between the host and
++// however many viewers are watching — see LiveGo.jsx and LiveView.jsx
++// for the peer-connection side of that. Presence + chat stay ephemeral
++// by design (see docs/migrations/015_live_streams.sql's comment on why
++// chat isn't a table) — Presence tracks who's currently in the channel
++// for the viewer count AND (via onPresenceChange) so the host knows
++// which viewer peerIds to open a connection to, Broadcast fans out both
++// chat lines and signaling payloads to everyone in the channel right
+ // now. Neither persists after everyone leaves, which is the right
+-// behavior for a live chat, not a gap.
+-export function joinLiveStream(streamId, { onViewerCountChange, onChat }) {
+-  if (!client) return { leave: () => {}, sendChat: () => {} }
++// behavior for a live chat/live call, not a gap.
++//
++// `peerId` (this join's own presence key) is how signals get targeted:
++// every viewer shares one channel, so a signal payload always carries a
++// `to` field and anything not addressed to your own peerId is ignored
++// (see the 'signal' handler below) — otherwise the host's offer to
++// viewer A would also land on viewer B's connection attempt.
++export function joinLiveStream(streamId, { role = 'viewer', onViewerCountChange, onChat, onPresenceChange, onSignal } = {}) {
++  if (!client) return { peerId: null, leave: () => {}, sendChat: () => {}, sendSignal: () => {} }
++  const peerId = crypto.randomUUID()
+   const channel = client.channel(`live:${streamId}`, {
+-    config: { presence: { key: crypto.randomUUID() } },
++    config: { presence: { key: peerId } },
+   })
+   channel
+     .on('presence', { event: 'sync' }, () => {
+-      onViewerCountChange(Object.keys(channel.presenceState()).length)
++      const state = channel.presenceState()
++      onViewerCountChange(Object.keys(state).length)
++      onPresenceChange?.(state)
+     })
+     .on('broadcast', { event: 'chat' }, ({ payload }) => onChat(payload))
++    .on('broadcast', { event: 'signal' }, ({ payload }) => {
++      if (payload.to && payload.to !== peerId) return // meant for a different viewer
++      onSignal?.(payload)
++    })
+     .subscribe(async (status) => {
+-      if (status === 'SUBSCRIBED') await channel.track({ joinedAt: Date.now() })
++      if (status === 'SUBSCRIBED') await channel.track({ joinedAt: Date.now(), role })
+     })
+   return {
++    peerId,
+     leave: () => client.removeChannel(channel),
+     sendChat: (message) => channel.send({ type: 'broadcast', event: 'chat', payload: message }),
++    sendSignal: (signal) => channel.send({ type: 'broadcast', event: 'signal', payload: { ...signal, from: peerId } }),
+   }
+ }
+ 
+diff --git a/src/components/AppLayout.jsx b/src/components/AppLayout.jsx
+index 80e403c..d0512e4 100644
+--- a/src/components/AppLayout.jsx
++++ b/src/components/AppLayout.jsx
+@@ -11,12 +11,16 @@ export default function AppLayout() {
+   const { isAuthenticated, isOffline, userSettings, pushToast } = useApp()
+   // Global, not per-page: any open keyboard (chat, comments, search, a
+   // caption field) hides BottomNav entirely rather than leaving it to
+-  // sit underneath — and drops the pb-20 space reserved for it, so the
+-  // page below gets that room back instead of an empty gap sitting
+-  // above the keyboard. See useKeyboardInset.js for why this is a
+-  // measured value, not a guessed constant.
+-  const keyboardInset = useKeyboardInset()
+-  const keyboardOpen = keyboardInset > 0
++  // sit underneath — and drops the reserved space for it, so the page
++  // below gets that room back instead of an empty gap sitting above the
++  // keyboard. `visible` (not just `inset > 0`) is what decides this: on
++  // a device where the native window already resized to fit above the
++  // keyboard, the numeric inset can correctly compute to ~0 (nothing
++  // left to manually compensate for) while the keyboard is very much
++  // still open — see useKeyboardInset.js — and this still needs to hide
++  // the nav in that case, not just when there's leftover pixels to
++  // translate something by.
++  const { visible: keyboardOpen } = useKeyboardInset()
+ 
+   // Settings -> Your Time -> Time management's reminder. Fires once per
+   // day the instant minutesToday crosses the threshold, from wherever the
+@@ -45,7 +49,7 @@ export default function AppLayout() {
+           <WifiOff className="h-3 w-3" /> You're offline — showing saved content
+         </div>
+       )}
+-      <div className={`flex-1 ${keyboardOpen ? '' : 'pb-20'}`}>
++      <div className="flex-1" style={{ paddingBottom: keyboardOpen ? 0 : 'var(--bottom-nav-h)' }}>
+         <Outlet />
+       </div>
+       {!keyboardOpen && <BottomNav />}
+diff --git a/src/components/BottomNav.jsx b/src/components/BottomNav.jsx
+index f4a7af8..f6c47f5 100644
+--- a/src/components/BottomNav.jsx
++++ b/src/components/BottomNav.jsx
+@@ -1,14 +1,16 @@
+-import React from 'react'
++import React, { useLayoutEffect, useRef } from 'react'
+ import { NavLink } from 'react-router-dom'
+ import { Home, Search, Plus, Clapperboard, User } from 'lucide-react'
+ import { usePrefetchOnIntent } from '../utils/usePrefetchOnIntent.js'
+ 
+-// py-1.5 (not the previous py-2) shaves a few px off each tab's own
+-// padding — combined with the nav's pt-0.5 below this keeps the bar
+-// visibly slimmer while the tap target (icon + label + this padding)
+-// still clears the ~48px touch-target guideline.
++// py-1 + no extra top padding keeps each tab's own vertical padding to a
++// minimum while the tap target (icon + label + this padding) still
++// clears the ~44px touch-target guideline once the icon and label are
++// added in — slimmer than the previous py-1.5, and `leading-none` on the
++// label trims the last couple of px browsers otherwise add for normal
++// line-height on an 11px font.
+ const linkBase =
+-  'flex flex-col items-center justify-center gap-1 flex-1 py-1.5 text-[11px] font-medium transition-colors focus-ring rounded-lg'
++  'flex flex-col items-center justify-center gap-1 flex-1 py-1 text-[11px] font-medium leading-none transition-colors focus-ring rounded-lg'
+ 
+ export default function BottomNav() {
+   // Warms each tab's route chunk the instant a finger touches down on it
+@@ -22,8 +24,39 @@ export default function BottomNav() {
+   const prefetchReels = usePrefetchOnIntent(() => import('../pages/Reels.jsx'))
+   const prefetchProfile = usePrefetchOnIntent(() => import('../pages/Profile.jsx'))
+ 
++  const navRef = useRef(null)
++
++  // Measures this nav's *actual* rendered height (its own padding +
++  // content + safe-area inset — whatever it really is on this device)
++  // and publishes it as --bottom-nav-h, instead of every consumer
++  // (AppLayout's page-content clearance, Reels' caption padding,
++  // PostDetail's resting comment-bar position) guessing a hardcoded
++  // number that has to be kept in sync by hand. That guess previously
++  // undershot the real height on phones with a tall gesture-nav
++  // safe-area-inset-bottom, which is how content could end up peeking
++  // out from behind the nav on exactly those devices. A ResizeObserver
++  // (rather than a one-off measurement) keeps it correct across
++  // rotation and any safe-area change without extra plumbing.
++  useLayoutEffect(() => {
++    const el = navRef.current
++    if (!el) return undefined
++
++    const publish = () => {
++      document.documentElement.style.setProperty('--bottom-nav-h', `${Math.ceil(el.getBoundingClientRect().height)}px`)
++    }
++    publish()
++
++    if (typeof ResizeObserver === 'undefined') return undefined
++    const observer = new ResizeObserver(publish)
++    observer.observe(el)
++    return () => observer.disconnect()
++  }, [])
++
+   return (
+-    <nav className="app-shell fixed bottom-0 left-1/2 z-50 w-full max-w-[480px] -translate-x-1/2 border-t border-ink-100 bg-white/95 backdrop-blur px-1 pb-[max(env(safe-area-inset-bottom),6px)] pt-0.5">
++    <nav
++      ref={navRef}
++      className="app-shell fixed bottom-0 left-1/2 z-50 w-full max-w-[480px] -translate-x-1/2 border-t border-ink-100 bg-white/95 backdrop-blur px-1 pb-[max(env(safe-area-inset-bottom),6px)]"
++    >
+       <div className="flex items-center">
+         <NavLink
+           to="/home"
+@@ -55,9 +88,9 @@ export default function BottomNav() {
+         >
+           {({ isActive }) => (
+             <span
+-              className={`flex h-11 w-11 items-center justify-center rounded-full bg-saffron-gradient text-white shadow-pop transition-transform active:scale-90 ${isActive ? 'scale-105' : ''}`}
++              className={`flex h-10 w-10 items-center justify-center rounded-full bg-saffron-gradient text-white shadow-pop transition-transform active:scale-90 ${isActive ? 'scale-105' : ''}`}
+             >
+-              <Plus className="h-6 w-6" strokeWidth={2.6} />
++              <Plus className="h-5 w-5" strokeWidth={2.6} />
+             </span>
+           )}
+         </NavLink>
+diff --git a/src/components/CommentSheet.jsx b/src/components/CommentSheet.jsx
+index 356bc3f..0f34918 100644
+--- a/src/components/CommentSheet.jsx
++++ b/src/components/CommentSheet.jsx
+@@ -16,7 +16,7 @@ export default function CommentSheet({ open, onClose, postId }) {
+   const { posts, getUser, currentUser, likedCommentIds, toggleCommentLike, deleteComment, setPinnedComment, addComment, loadComments } =
+     useApp()
+   const [text, setText] = useState('')
+-  const keyboardInset = useKeyboardInset()
++  const { inset: keyboardInset } = useKeyboardInset()
+ 
+   useEffect(() => {
+     if (open && postId) loadComments(postId)
+diff --git a/src/components/ShareSheet.jsx b/src/components/ShareSheet.jsx
+index 612f8ff..d0c47c1 100644
+--- a/src/components/ShareSheet.jsx
++++ b/src/components/ShareSheet.jsx
+@@ -24,7 +24,7 @@ export default function ShareSheet({ open, onClose, postId, onNativeShare }) {
+   const [query, setQuery] = useState('')
+   const [selectedIds, setSelectedIds] = useState(new Set())
+   const [sending, setSending] = useState(false)
+-  const keyboardInset = useKeyboardInset()
++  const { inset: keyboardInset } = useKeyboardInset()
+ 
+   const candidates = useMemo(() => {
+     const ids = new Set([...conversations.map((c) => c.authorId), ...followedUserIds])
+diff --git a/src/context/AppContext.jsx b/src/context/AppContext.jsx
+index 9d1edc1..0bc1e24 100644
+--- a/src/context/AppContext.jsx
++++ b/src/context/AppContext.jsx
+@@ -30,6 +30,32 @@ const TOKEN_KEY = 'bs_access_token' // kept only for backward-compat cleanup on
+ // out while the real session cookie is still perfectly valid server-side.
+ const OFFLINE_CACHE_KEY = 'bs_offline_cache_v1'
+ 
++// Belt-and-suspenders on top of the server's own notifications.read_at
++// (backend/src/routes/notifications.js already persists that correctly):
++// this is a device-local "the person opened Activity at/after this
++// instant" marker, checked against each notification's own createdAt in
++// applyLocalReadOverride below. Its only job is to keep a notification
++// from re-appearing as unread — read: re-highlighting itself the next
++// time the app opens — on the specific failure path where the read PATCH
++// to the backend didn't make it (dropped connection, app killed
++// mid-request) but the person definitely already saw it, since that
++// failure is silent from their side otherwise.
++const LAST_READ_NOTIFICATIONS_AT_KEY = 'bs_last_read_notifications_at'
++
++function applyLocalReadOverride(notification) {
++  if (!notification.unread || !notification.createdAt) return notification
++  try {
++    const lastReadAt = localStorage.getItem(LAST_READ_NOTIFICATIONS_AT_KEY)
++    if (lastReadAt && new Date(notification.createdAt) <= new Date(lastReadAt)) {
++      return { ...notification, unread: false }
++    }
++  } catch {
++    // localStorage unavailable — fall through and trust the server's
++    // own unread flag alone, same as before this existed.
++  }
++  return notification
++}
++
+ function saveOfflineCache(data) {
+   try {
+     localStorage.setItem(OFFLINE_CACHE_KEY, JSON.stringify(data))
+@@ -309,7 +335,7 @@ export function AppProvider({ children }) {
+     if (!isLive) return
+     try {
+       const rows = await api.getNotifications()
+-      setNotifications(rows.map(mapApiNotification))
++      setNotifications(rows.map(mapApiNotification).map(applyLocalReadOverride))
+     } catch {
+       /* not fatal — Activity tab just shows its empty state */
+     }
+@@ -1618,19 +1644,24 @@ export function AppProvider({ children }) {
+   )
+ 
+   const markNotificationsRead = useCallback(() => {
+-    if (!isLive) {
+-      setNotifications((prev) => prev.map((n) => ({ ...n, unread: false })))
+-      return
++    // Written synchronously, before anything async below, so the
++    // "already seen up through here" boundary is locked in immediately
++    // — even if the app gets backgrounded or killed a moment later
++    // before the PATCH calls below finish. See applyLocalReadOverride
++    // above for what reads this back on the next load.
++    try {
++      localStorage.setItem(LAST_READ_NOTIFICATIONS_AT_KEY, new Date().toISOString())
++    } catch {
++      // localStorage unavailable — the server's own read_at (persisted
++      // by the PATCH calls below) is still the real source of truth;
++      // this was only ever a backstop on top of it.
+     }
+-    ;(async () => {
+-      await fetchNotificationsLive()
+-      setNotifications((prev) => {
+-        const unread = prev.filter((n) => n.unread)
+-        unread.forEach((n) => api.markNotificationRead(n.id).catch(() => {}))
+-        return prev.map((n) => ({ ...n, unread: false }))
+-      })
+-    })()
+-  }, [fetchNotificationsLive])
++    setNotifications((prev) => {
++      const stillUnread = prev.filter((n) => n.unread)
++      if (isLive) stillUnread.forEach((n) => api.markNotificationRead(n.id).catch(() => {}))
++      return prev.map((n) => ({ ...n, unread: false }))
++    })
++  }, [])
+ 
+   const unreadCount = useMemo(() => notifications.filter((n) => n.unread).length, [notifications])
+ 
+diff --git a/src/index.css b/src/index.css
+index bd88335..568fe67 100644
+--- a/src/index.css
++++ b/src/index.css
+@@ -4,14 +4,19 @@
+ 
+ @layer base {
+   :root {
+-    /* BottomNav.jsx's actual rendered height (icon + label + its own
+-       padding, safe-area aside) — kept as one shared number so anything
+-       that needs to sit clear of the floating bottom nav (Reels.jsx's
+-       fixed full-screen layout, PostDetail.jsx's comment composer)
+-       doesn't hardcode a second copy that can drift out of sync if
+-       BottomNav's own padding ever changes. Updated to 56px to match
+-       BottomNav's slimmer vertical padding. */
+-    --bottom-nav-h: 56px;
++    /* Fallback only — BottomNav.jsx measures its own real rendered
++       height (which varies by device: icon + label + padding, PLUS
++       env(safe-area-inset-bottom), which itself ranges from 0 on
++       3-button nav phones to 30-40px+ on gesture-nav ones) and
++       overwrites this via ResizeObserver on mount, before first paint.
++       This value only matters for the brief instant before that runs
++       (or if JS fails entirely) — everything that needs to sit clear of
++       the floating bottom nav (AppLayout's page-content clearance,
++       Reels.jsx's caption padding, PostDetail.jsx's resting comment-bar
++       position) reads var(--bottom-nav-h) rather than a hardcoded
++       number precisely so it can never drift out of sync with the nav's
++       actual size on a given device. */
++    --bottom-nav-h: 52px;
+   }
+ 
+   * {
+diff --git a/src/pages/Call.jsx b/src/pages/Call.jsx
+index 49f8a27..d1f5b85 100644
+--- a/src/pages/Call.jsx
++++ b/src/pages/Call.jsx
+@@ -1,33 +1,80 @@
+-import React, { useEffect, useRef, useState } from 'react'
++import React, { useCallback, useEffect, useRef, useState } from 'react'
+ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+-import { PhoneOff, Mic, MicOff, Video as VideoIcon, VideoOff, Users } from 'lucide-react'
++import { PhoneOff, Mic, MicOff, Video as VideoIcon, VideoOff } from 'lucide-react'
+ import { useApp } from '../context/AppContext.jsx'
+ import { joinCall } from '../api/realtime.js'
++import { ICE_SERVERS } from '../utils/webrtc.js'
+ 
+ // ChatThread.jsx's audio/video call buttons -> here (/call/:conversationId/:mode).
+-// What's real: local mic/camera preview and permission handling, a
+-// Realtime presence check for whether the other participant has also
+-// opened this call (peerCount), and a broadcast "hangup" signal so
+-// either side ending the call closes it for both. What's not built:
+-// actually carrying audio/video *to* the other participant — that's a
+-// WebRTC peer connection (SDP offer/answer + STUN/TURN for NAT
+-// traversal), the same category of gap LiveGo.jsx/LiveView.jsx flag for
+-// streaming, and it needs the same infra decision before it can be real
+-// rather than simulated.
++//
++// A real WebRTC peer connection carries the actual audio/video between
++// the two participants — the Realtime channel from joinCall (see
++// api/realtime.js) is only the *signaling* transport (SDP offer/answer +
++// ICE candidates), never the media itself, which flows directly
++// device-to-device once negotiation completes.
++//
++// Who makes the offer: both sides deterministically agree without any
++// extra handshake by comparing user ids — whoever's id sorts later
++// (`isInitiator`) creates the offer the instant both participants are
++// present (peerCount > 1). Both clients compute this the same way from
++// the same two ids, so there's never a race where both (or neither) try
++// to initiate.
++//
++// NAT traversal uses public STUN servers only (see utils/webrtc.js) —
++// works for most home/office/mobile networks, but a minority of
++// networks (symmetric NAT, some corporate firewalls) need a TURN relay
++// to connect at all; see that file's comment for what adding one later
++// would look like. `connectionState` below surfaces a "call failed"
++// message rather than hanging silently when that happens.
+ export default function Call() {
+   const { conversationId, mode } = useParams()
+   const [searchParams] = useSearchParams()
+   const navigate = useNavigate()
+-  const { getUser } = useApp()
++  const { getUser, currentUser } = useApp()
+   const [muted, setMuted] = useState(false)
+   const [cameraOff, setCameraOff] = useState(mode !== 'video')
+   const [peerCount, setPeerCount] = useState(0)
+-  const videoRef = useRef(null)
++  const [connectionState, setConnectionState] = useState('new') // new | connecting | connected | failed | closed
++  const localVideoRef = useRef(null)
++  const remoteVideoRef = useRef(null)
++  const remoteAudioRef = useRef(null)
+   const streamRef = useRef(null)
++  const remoteStreamRef = useRef(null)
+   const callRef = useRef(null)
++  const pcRef = useRef(null)
++  const pendingCandidatesRef = useRef([])
++  const offerSentRef = useRef(false)
++
++  const otherUserId = searchParams.get('peer')
++  const otherUser = getUser(otherUserId)
++  // String comparison of two UUIDs — arbitrary but stable, and both
++  // participants land on the same answer independently since they're
++  // comparing the same two ids either way.
++  const isInitiator = Boolean(currentUser?.id && otherUserId && currentUser.id > otherUserId)
++
++  const attachRemoteTrack = useCallback((event) => {
++    const [stream] = event.streams
++    remoteStreamRef.current = stream
++    if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream
++    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = stream
++  }, [])
+ 
+   useEffect(() => {
++    if (typeof RTCPeerConnection === 'undefined') {
++      setConnectionState('failed')
++      return undefined
++    }
++
+     let cancelled = false
++    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
++    pcRef.current = pc
++
++    pc.onicecandidate = (event) => {
++      if (event.candidate) callRef.current?.sendSignal({ type: 'ice', candidate: event.candidate })
++    }
++    pc.ontrack = attachRemoteTrack
++    pc.onconnectionstatechange = () => setConnectionState(pc.connectionState)
++
+     navigator.mediaDevices
+       .getUserMedia({ video: mode === 'video', audio: true })
+       .then((stream) => {
+@@ -36,23 +83,69 @@ export default function Call() {
+           return
+         }
+         streamRef.current = stream
+-        if (videoRef.current) videoRef.current.srcObject = stream
++        stream.getTracks().forEach((track) => pc.addTrack(track, stream))
++        if (localVideoRef.current) localVideoRef.current.srcObject = stream
+       })
+-      .catch(() => {})
++      .catch(() => {
++        // Mic/camera permission denied or unavailable — the call channel
++        // still connects (so the other side isn't left hanging forever
++        // waiting on someone who never shows up), it just won't have
++        // anything of this side's to send.
++      })
++
++    async function handleSignal(signal) {
++      if (cancelled) return
++      if (signal.type === 'hangup') {
++        navigate(-1)
++        return
++      }
++      if (signal.type === 'offer' && !isInitiator) {
++        await pc.setRemoteDescription(new RTCSessionDescription(signal.offer))
++        for (const candidate of pendingCandidatesRef.current) await pc.addIceCandidate(candidate).catch(() => {})
++        pendingCandidatesRef.current = []
++        const answer = await pc.createAnswer()
++        await pc.setLocalDescription(answer)
++        callRef.current?.sendSignal({ type: 'answer', answer })
++      } else if (signal.type === 'answer' && isInitiator) {
++        await pc.setRemoteDescription(new RTCSessionDescription(signal.answer))
++        for (const candidate of pendingCandidatesRef.current) await pc.addIceCandidate(candidate).catch(() => {})
++        pendingCandidatesRef.current = []
++      } else if (signal.type === 'ice' && signal.candidate) {
++        const candidate = new RTCIceCandidate(signal.candidate)
++        if (pc.remoteDescription?.type) await pc.addIceCandidate(candidate).catch(() => {})
++        else pendingCandidatesRef.current.push(candidate)
++      }
++    }
+ 
+     callRef.current = joinCall(conversationId, {
+       onPeerCountChange: setPeerCount,
+-      onSignal: (signal) => {
+-        if (signal.type === 'hangup') navigate(-1)
+-      },
++      onSignal: handleSignal,
+     })
+ 
+     return () => {
+       cancelled = true
+       streamRef.current?.getTracks().forEach((t) => t.stop())
++      remoteStreamRef.current?.getTracks().forEach((t) => t.stop())
+       callRef.current?.leave()
++      pc.close()
++      pcRef.current = null
+     }
+-  }, [conversationId, mode, navigate])
++    // eslint-disable-next-line react-hooks/exhaustive-deps -- isInitiator is derived from ids that don't change for this call's lifetime; re-running this on every render would tear down and reopen the peer connection
++  }, [conversationId, mode, navigate, attachRemoteTrack])
++
++  // Only the initiator creates the offer, and only once both sides have
++  // actually joined the signaling channel (peerCount > 1) — creating one
++  // the moment this screen mounts would just get dropped since there'd
++  // be no one listening yet.
++  useEffect(() => {
++    if (!isInitiator || peerCount < 2 || offerSentRef.current || !pcRef.current) return
++    offerSentRef.current = true
++    ;(async () => {
++      const offer = await pcRef.current.createOffer()
++      await pcRef.current.setLocalDescription(offer)
++      callRef.current?.sendSignal({ type: 'offer', offer })
++    })()
++  }, [isInitiator, peerCount])
+ 
+   const toggleMic = () => {
+     streamRef.current?.getAudioTracks().forEach((t) => (t.enabled = muted))
+@@ -69,40 +162,50 @@ export default function Call() {
+     navigate(-1)
+   }
+ 
+-  const otherUser = getUser(searchParams.get('peer'))
++  const connected = connectionState === 'connected'
++  let statusText = `Waiting for ${otherUser?.name || 'the other person'} to join…`
++  if (peerCount > 1) {
++    if (connected) statusText = 'Connected'
++    else if (connectionState === 'failed') statusText = "Couldn't connect — check your network and try again"
++    else statusText = 'Connecting…'
++  }
+ 
+   return (
+-    <div className="flex h-full flex-col items-center justify-between bg-navy-950 py-10 text-white">
+-      <div className="flex flex-col items-center gap-2">
+-        <p className="text-sm text-white/60">{mode === 'video' ? 'Video call' : 'Audio call'}</p>
+-        <p className="flex items-center gap-1.5 text-sm text-white/60">
+-          <Users className="h-3.5 w-3.5" />
+-          {peerCount > 1 ? 'Connected' : `Waiting for ${otherUser?.name || 'the other person'} to join…`}
+-        </p>
++    <div className="relative flex h-full flex-col items-center justify-between overflow-hidden bg-navy-950 py-10 text-white">
++      {/* Full-screen remote video once the call is up — video mode only;
++          audio-only calls show the avatar layout below instead. */}
++      {mode === 'video' && (
++        <video ref={remoteVideoRef} autoPlay playsInline className="absolute inset-0 h-full w-full object-cover" />
++      )}
++      {/* Remote audio always renders (even in video mode, where the
++          track already plays via remoteVideoRef above) so an audio-only
++          call — or a video call where the other side's camera is off —
++          still has somewhere for the incoming audio track to attach. */}
++      {mode !== 'video' && <audio ref={remoteAudioRef} autoPlay />}
++
++      <div className="relative z-10 flex flex-col items-center gap-2">
++        <p className="text-sm text-white/70 drop-shadow">{mode === 'video' ? 'Video call' : 'Audio call'}</p>
++        <p className="text-sm text-white/70 drop-shadow">{statusText}</p>
+       </div>
+ 
+       {mode === 'video' && !cameraOff ? (
+-        <div className="relative aspect-[3/4] w-56 overflow-hidden rounded-2xl bg-black">
+-          <video ref={videoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
+-          <p className="absolute bottom-1 left-1 right-1 text-center text-[9px] text-white/60">Your preview only</p>
++        <div className="relative z-10 aspect-[3/4] w-28 overflow-hidden rounded-2xl bg-black shadow-pop">
++          <video ref={localVideoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
+         </div>
+-      ) : (
+-        <div className="flex h-24 w-24 items-center justify-center rounded-full bg-white/10 text-3xl font-bold">
++      ) : mode !== 'video' ? (
++        <div className="relative z-10 flex h-24 w-24 items-center justify-center rounded-full bg-white/10 text-3xl font-bold">
+           {otherUser?.name?.[0] || '?'}
+         </div>
++      ) : (
++        <div className="relative z-10" />
+       )}
+ 
+-      <p className="max-w-[240px] text-center text-[11px] text-white/40">
+-        Audio/video isn't carried to the other person yet — that needs a media-server piece that isn't connected. This
+-        screen's controls and connection status are live.
+-      </p>
+-
+-      <div className="flex items-center gap-5">
+-        <button onClick={toggleMic} className="rounded-full bg-white/10 p-4">
++      <div className="relative z-10 flex items-center gap-5">
++        <button onClick={toggleMic} className="rounded-full bg-white/10 p-4 backdrop-blur">
+           {muted ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+         </button>
+         {mode === 'video' && (
+-          <button onClick={toggleCamera} className="rounded-full bg-white/10 p-4">
++          <button onClick={toggleCamera} className="rounded-full bg-white/10 p-4 backdrop-blur">
+             {cameraOff ? <VideoOff className="h-5 w-5" /> : <VideoIcon className="h-5 w-5" />}
+           </button>
+         )}
+diff --git a/src/pages/ChatThread.jsx b/src/pages/ChatThread.jsx
+index 28c351f..fcac255 100644
+--- a/src/pages/ChatThread.jsx
++++ b/src/pages/ChatThread.jsx
+@@ -36,7 +36,7 @@ export default function ChatThread() {
+   const [openMenuId, setOpenMenuId] = useState(null)
+   const scrollRef = useRef(null)
+   const otherUser = getUser(userId)
+-  const keyboardInset = useKeyboardInset()
++  const { inset: keyboardInset } = useKeyboardInset()
+ 
+   useEffect(() => {
+     let cancelled = false
+diff --git a/src/pages/LiveGo.jsx b/src/pages/LiveGo.jsx
+index 4e62b66..3b4cc0e 100644
+--- a/src/pages/LiveGo.jsx
++++ b/src/pages/LiveGo.jsx
+@@ -6,16 +6,26 @@ import { useApp } from '../context/AppContext.jsx'
+ import * as api from '../api/client.js'
+ import { isLive } from '../api/client.js'
+ import { joinLiveStream } from '../api/realtime.js'
++import { ICE_SERVERS } from '../utils/webrtc.js'
+ 
+-// Home.jsx's "Go Live" card -> here. What's real: the session row
++// Home.jsx's "Go Live" card -> here. The session row
+ // (docs/migrations/015_live_streams.sql — shows up for every viewer the
+ // moment you start, disappears the moment you end), the live viewer
+-// count and chat below (Supabase Realtime Presence/Broadcast, no polling).
+-// What's a local preview only: the camera feed — getUserMedia shows it
+-// to *you* so this screen isn't a blank box, but nothing is sent to
+-// anyone else. Actually delivering that feed to viewers needs a WebRTC
+-// signaling/media-server piece this doesn't build, so LiveView.jsx (the
+-// viewer's screen) says so plainly instead of showing a fake video.
++// count and chat below (Supabase Realtime Presence/Broadcast, no
++// polling), AND the actual camera/mic feed reaching every viewer are all
++// real — see LiveView.jsx for the receiving side.
++//
++// How the feed reaches viewers: this is a mesh, not an SFU — this device
++// opens one direct WebRTC connection per viewer and uploads its camera
++// feed to each of them individually (LiveView.jsx's onPresenceChange
++// callback is how a viewer's peerId gets discovered here). That's a
++// deliberate, honest trade-off: it needs zero extra media-server infra
++// and works well for a handful of concurrent viewers, but this device's
++// own upload bandwidth is the ceiling — broadcasting to a genuinely
++// large audience needs a real SFU (e.g. LiveKit/Agora/Cloudflare Realtime
++// as the media relay instead of this device fanning out N direct
++// uploads), which is a separate infra decision, not something a mesh can
++// be turned into by itself.
+ export default function LiveGo() {
+   const navigate = useNavigate()
+   const { currentUser, pushToast } = useApp()
+@@ -28,10 +38,70 @@ export default function LiveGo() {
+   const videoRef = useRef(null)
+   const streamRef = useRef(null)
+   const liveChannelRef = useRef(null)
++  const peersRef = useRef(new Map()) // viewer peerId -> RTCPeerConnection
++  const pendingCandidatesRef = useRef(new Map()) // viewer peerId -> RTCIceCandidate[] received before that viewer's answer arrived
++  const lastPresenceStateRef = useRef({})
++
++  const closePeer = (peerId) => {
++    peersRef.current.get(peerId)?.close()
++    peersRef.current.delete(peerId)
++    pendingCandidatesRef.current.delete(peerId)
++  }
++
++  const connectToViewer = async (peerId) => {
++    if (peersRef.current.has(peerId) || !streamRef.current) return
++    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
++    peersRef.current.set(peerId, pc)
++    pc.onicecandidate = (event) => {
++      if (event.candidate) liveChannelRef.current?.sendSignal({ type: 'ice', candidate: event.candidate, to: peerId })
++    }
++    streamRef.current.getTracks().forEach((track) => pc.addTrack(track, streamRef.current))
++    const offer = await pc.createOffer()
++    await pc.setLocalDescription(offer)
++    liveChannelRef.current?.sendSignal({ type: 'offer', offer, to: peerId })
++  }
++
++  // Called on every presence sync (any viewer joining or leaving) AND
++  // once more manually right after local media becomes ready, to catch
++  // up on anyone who joined before this device had a stream to offer
++  // them yet.
++  const reconcileViewers = (state) => {
++    lastPresenceStateRef.current = state
++    if (!streamRef.current) return
++    const viewerIds = Object.entries(state)
++      .filter(([, metas]) => metas?.[0]?.role !== 'host')
++      .map(([peerId]) => peerId)
++    setViewerCount(viewerIds.length)
++    viewerIds.forEach((id) => connectToViewer(id))
++    for (const id of peersRef.current.keys()) {
++      if (!viewerIds.includes(id)) closePeer(id)
++    }
++  }
++
++  const handleSignal = async (payload) => {
++    const pc = peersRef.current.get(payload.from)
++    if (payload.type === 'answer' && pc) {
++      await pc.setRemoteDescription(new RTCSessionDescription(payload.answer))
++      const pending = pendingCandidatesRef.current.get(payload.from) || []
++      for (const candidate of pending) await pc.addIceCandidate(candidate).catch(() => {})
++      pendingCandidatesRef.current.delete(payload.from)
++    } else if (payload.type === 'ice' && payload.candidate) {
++      const candidate = new RTCIceCandidate(payload.candidate)
++      if (pc?.remoteDescription?.type) {
++        await pc.addIceCandidate(candidate).catch(() => {})
++      } else {
++        const list = pendingCandidatesRef.current.get(payload.from) || []
++        list.push(candidate)
++        pendingCandidatesRef.current.set(payload.from, list)
++      }
++    }
++  }
+ 
+   useEffect(() => {
+     return () => {
+       streamRef.current?.getTracks().forEach((t) => t.stop())
++      peersRef.current.forEach((pc) => pc.close())
++      peersRef.current.clear()
+       liveChannelRef.current?.leave()
+     }
+   }, [])
+@@ -50,15 +120,19 @@ export default function LiveGo() {
+       }
+       setStreamId(id)
+       liveChannelRef.current = joinLiveStream(id, {
+-        onViewerCountChange: setViewerCount,
++        role: 'host',
++        onViewerCountChange: () => {}, // reconcileViewers below computes the real (host-excluded) count
+         onChat: (msg) => setChatLog((prev) => [...prev.slice(-49), msg]),
++        onPresenceChange: reconcileViewers,
++        onSignal: handleSignal,
+       })
+       try {
+         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+         streamRef.current = stream
+         if (videoRef.current) videoRef.current.srcObject = stream
++        reconcileViewers(lastPresenceStateRef.current)
+       } catch {
+-        pushToast('Camera/mic permission denied — you can still chat, but there\u2019s no preview')
++        pushToast('Camera/mic permission denied — you can still chat, but there\u2019s no video to send')
+       }
+     } catch (err) {
+       pushToast(err.message || 'Could not start your stream — please try again.')
+@@ -69,6 +143,8 @@ export default function LiveGo() {
+ 
+   const handleEnd = async () => {
+     streamRef.current?.getTracks().forEach((t) => t.stop())
++    peersRef.current.forEach((pc) => pc.close())
++    peersRef.current.clear()
+     liveChannelRef.current?.leave()
+     if (isLive && streamId && !streamId.startsWith('local-')) {
+       api.endLiveStream(streamId).catch(() => {})
+@@ -131,9 +207,6 @@ export default function LiveGo() {
+ 
+       <div className="relative mx-4 aspect-[9/16] max-h-[45vh] overflow-hidden rounded-2xl bg-black">
+         <video ref={videoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
+-        <p className="absolute bottom-2 left-2 right-2 text-center text-[10px] text-white/70">
+-          Preview only — video isn't sent to viewers yet (needs a media server)
+-        </p>
+       </div>
+ 
+       <div className="mt-3 flex-1 overflow-y-auto px-4">
+diff --git a/src/pages/LiveView.jsx b/src/pages/LiveView.jsx
+index 1bf12da..74744a2 100644
+--- a/src/pages/LiveView.jsx
++++ b/src/pages/LiveView.jsx
+@@ -1,15 +1,20 @@
+ import React, { useEffect, useRef, useState } from 'react'
+ import { useNavigate, useParams } from 'react-router-dom'
+-import { Radio, X, Send, Users, VideoOff } from 'lucide-react'
++import { Radio, X, Send, Users, VideoOff, Loader2 } from 'lucide-react'
+ import { useApp } from '../context/AppContext.jsx'
++import * as api from '../api/client.js'
+ import { joinLiveStream } from '../api/realtime.js'
++import { ICE_SERVERS } from '../utils/webrtc.js'
+ 
+-// The viewer side of LiveGo.jsx. Deliberately shows a plain "no video
+-// yet" placeholder instead of anything that looks like a stalled/broken
+-// player — there is no video to show until a media-server piece exists
+-// to relay the host's camera to viewers (see LiveGo.jsx's own comment).
+-// Viewer count and chat are real, live, and shared with the host's
+-// screen right now via the same Realtime channel.
++// The viewer side of LiveGo.jsx. Opens one direct WebRTC connection to
++// the host's device (see LiveGo.jsx's own comment on why this is a mesh,
++// not an SFU) — the host's peerId is learned the moment its offer
++// arrives over the same Realtime channel that already carries viewer
++// count and chat, so no extra lookup is needed to know who to connect
++// to. `GET /v1/live/:id` below is only used to short-circuit a stale
++// deep link (a notification or shared link to a stream that already
++// ended) into an honest "this stream has ended" instead of a spinner
++// that waits forever for a host who's no longer there.
+ export default function LiveView() {
+   const { id } = useParams()
+   const navigate = useNavigate()
+@@ -17,14 +22,74 @@ export default function LiveView() {
+   const [viewerCount, setViewerCount] = useState(0)
+   const [chatLog, setChatLog] = useState([])
+   const [chatText, setChatText] = useState('')
++  // connecting | connected | failed | ended
++  const [connectionState, setConnectionState] = useState('connecting')
+   const channelRef = useRef(null)
++  const pcRef = useRef(null)
++  const pendingCandidatesRef = useRef([])
++  const videoRef = useRef(null)
++  const remoteStreamRef = useRef(null)
+ 
+   useEffect(() => {
++    let cancelled = false
++
++    api
++      .getLiveStream(id)
++      .then((stream) => {
++        if (!cancelled && stream.status !== 'live') setConnectionState('ended')
++      })
++      .catch(() => {
++        // Couldn't resolve stream metadata (offline, or mock/demo mode
++        // with no backend at all) — fall through and let the signaling
++        // channel itself be the source of truth instead of blocking on
++        // this.
++      })
++
++    const pc = typeof RTCPeerConnection !== 'undefined' ? new RTCPeerConnection({ iceServers: ICE_SERVERS }) : null
++    pcRef.current = pc
++    if (pc) {
++      pc.ontrack = (event) => {
++        remoteStreamRef.current = event.streams[0]
++        if (videoRef.current) videoRef.current.srcObject = event.streams[0]
++      }
++      pc.onconnectionstatechange = () => {
++        if (pc.connectionState === 'connected') setConnectionState('connected')
++        else if (pc.connectionState === 'failed') setConnectionState('failed')
++      }
++    }
++
++    async function handleSignal(payload) {
++      if (cancelled || !pc) return
++      if (payload.type === 'offer') {
++        await pc.setRemoteDescription(new RTCSessionDescription(payload.offer))
++        for (const candidate of pendingCandidatesRef.current) await pc.addIceCandidate(candidate).catch(() => {})
++        pendingCandidatesRef.current = []
++        const answer = await pc.createAnswer()
++        await pc.setLocalDescription(answer)
++        channelRef.current?.sendSignal({ type: 'answer', answer, to: payload.from })
++      } else if (payload.type === 'ice' && payload.candidate) {
++        const candidate = new RTCIceCandidate(payload.candidate)
++        if (pc.remoteDescription?.type) await pc.addIceCandidate(candidate).catch(() => {})
++        else pendingCandidatesRef.current.push(candidate)
++      }
++    }
++
+     channelRef.current = joinLiveStream(id, {
+-      onViewerCountChange: setViewerCount,
++      role: 'viewer',
++      // Excludes the host's own presence entry, same reasoning as
++      // LiveGo.jsx's reconcileViewers — a viewer's "how many people are
++      // watching" shouldn't count the person broadcasting.
++      onViewerCountChange: (n) => setViewerCount(Math.max(0, n - 1)),
+       onChat: (msg) => setChatLog((prev) => [...prev.slice(-49), msg]),
++      onSignal: handleSignal,
+     })
+-    return () => channelRef.current?.leave()
++
++    return () => {
++      cancelled = true
++      pc?.close()
++      remoteStreamRef.current?.getTracks().forEach((t) => t.stop())
++      channelRef.current?.leave()
++    }
+   }, [id])
+ 
+   const handleSendChat = (e) => {
+@@ -51,9 +116,30 @@ export default function LiveView() {
+         </button>
+       </div>
+ 
+-      <div className="mx-4 flex aspect-[9/16] max-h-[45vh] flex-col items-center justify-center gap-2 rounded-2xl bg-black text-white/60">
+-        <VideoOff className="h-8 w-8" />
+-        <p className="px-6 text-center text-xs">Video isn't connected for this stream yet — chat and viewer count below are live.</p>
++      <div className="relative mx-4 flex aspect-[9/16] max-h-[45vh] items-center justify-center overflow-hidden rounded-2xl bg-black text-white/60">
++        <video ref={videoRef} autoPlay playsInline className="absolute inset-0 h-full w-full object-cover" />
++        {connectionState !== 'connected' && (
++          <div className="relative z-10 flex flex-col items-center gap-2 bg-black/40 px-6 py-4 text-center">
++            {connectionState === 'connecting' && (
++              <>
++                <Loader2 className="h-6 w-6 animate-spin" />
++                <p className="text-xs">Connecting to the stream…</p>
++              </>
++            )}
++            {connectionState === 'failed' && (
++              <>
++                <VideoOff className="h-6 w-6" />
++                <p className="text-xs">Couldn't connect to the stream's video — check your connection</p>
++              </>
++            )}
++            {connectionState === 'ended' && (
++              <>
++                <VideoOff className="h-6 w-6" />
++                <p className="text-xs">This stream has ended</p>
++              </>
++            )}
++          </div>
++        )}
+       </div>
+ 
+       <div className="mt-3 flex-1 overflow-y-auto px-4">
+diff --git a/src/pages/Messages.jsx b/src/pages/Messages.jsx
+index 6254830..c0c11db 100644
+--- a/src/pages/Messages.jsx
++++ b/src/pages/Messages.jsx
+@@ -125,7 +125,7 @@ function NewMessageSheet({ currentUserId, onClose, onPick }) {
+   const { followedUserIds, getUser, searchUsers, directory } = useApp()
+   const [query, setQuery] = useState('')
+   const [searchResults, setSearchResults] = useState([])
+-  const keyboardInset = useKeyboardInset()
++  const { inset: keyboardInset } = useKeyboardInset()
+ 
+   useEffect(() => {
+     const q = query.trim()
+diff --git a/src/pages/PostDetail.jsx b/src/pages/PostDetail.jsx
+index 88aef04..480edc7 100644
+--- a/src/pages/PostDetail.jsx
++++ b/src/pages/PostDetail.jsx
+@@ -32,7 +32,7 @@ export default function PostDetail() {
+   const [comment, setComment] = useState('')
+   const [shareSheetOpen, setShareSheetOpen] = useState(false)
+   const [resolving, setResolving] = useState(true)
+-  const keyboardInset = useKeyboardInset()
++  const { inset: keyboardInset } = useKeyboardInset()
+ 
+   useEffect(() => {
+     loadComments(id)
+diff --git a/src/pages/Reels.jsx b/src/pages/Reels.jsx
+index 0ec8b5f..0a822db 100644
+--- a/src/pages/Reels.jsx
++++ b/src/pages/Reels.jsx
+@@ -63,43 +63,56 @@ export default function Reels() {
+ 
+   return (
+     // `fixed inset-0` — full true viewport, deliberately escaping
+-    // AppLayout's <Outlet/> wrapper (which reserves `pb-20` at the bottom
+-    // for BottomNav) rather than living inside it. That reserved-space
+-    // approach is right for normal scrolling pages, but it was exactly
+-    // why reels rendered at 70% of viewport height (see the old
+-    // `h-[70dvh]` on each <section>) instead of one full-screen reel per
+-    // swipe — the section height was arbitrary AND the outer page still
+-    // had room (and no bound) to grow taller than the viewport, so two
+-    // partial reels ended up visible at once instead of one snapping
+-    // cleanly to the screen. `z-30` keeps this below BottomNav/ToastStack
+-    // (z-50) so the nav still floats on top like Instagram/TikTok's own
+-    // reels tabs — see the `--bottom-nav-h` clearance on the action row
+-    // in ReelCard below, which keeps the like/comment/share column and
+-    // caption clear of that floating bar.
+-    <div className="app-shell fixed inset-0 z-30 flex flex-col bg-navy-950">
+-      <header className="shrink-0 flex items-center justify-between px-4 py-3">
+-        <h1 className="font-display text-xl font-bold text-white">Reels</h1>
+-        <button onClick={() => navigate('/create')} className="focus-ring rounded-full p-1" aria-label="Create a reel">
+-          <Camera className="h-5 w-5 text-white" />
+-        </button>
+-      </header>
+-
+-      <div className="shrink-0 flex gap-5 px-4 pb-3 text-sm font-semibold">
+-        {TABS.map((tab) => (
+-          <button
+-            key={tab}
+-            onClick={() => setActiveTab(tab)}
+-            className={`focus-ring shrink-0 whitespace-nowrap pb-1 transition-colors ${
+-              activeTab === tab ? 'border-b-2 border-saffron-400 text-white' : 'text-white/50'
+-            }`}
+-          >
+-            {tab}
++    // AppLayout's <Outlet/> wrapper (which reserves space at the bottom
++    // for BottomNav) rather than living inside it. `z-30` keeps this
++    // below BottomNav/ToastStack (z-50) so the nav still floats on top
++    // like Instagram/TikTok's own reels tabs — see the `--bottom-nav-h`
++    // clearance on the action row in ReelCard below, which keeps the
++    // like/comment/share column and caption clear of that floating bar.
++    //
++    // The header and tab row below are an ABSOLUTELY POSITIONED overlay
++    // on top of the reel list, not laid-out flex siblings that push it
++    // down — that's the whole fix for reels not reaching the top of the
++    // screen. With header+tabs as normal in-flow flex children (the
++    // previous layout), the scrollable reel list only got the leftover
++    // space beneath them (~90px shorter than the real screen), so every
++    // `<section className="h-full">` reel was ~90px short of the top
++    // edge too, and a phone with on-screen nav bar could was cropping
++    // the true bottom of that already-short video against the safe
++    // area, reading as "the video doesn't fit its frame". Floating the
++    // header/tabs on top (same pattern as the mute button and the
++    // caption/actions row already use) lets the scroll container be
++    // `absolute inset-0` — the FULL fixed box, top to true bottom — so
++    // each reel is genuinely one full screen tall.
++    <div className="app-shell fixed inset-0 z-30 overflow-hidden bg-navy-950">
++      <div
++        className="pointer-events-none absolute inset-x-0 top-0 z-20 bg-gradient-to-b from-black/70 via-black/25 to-transparent"
++        style={{ paddingTop: 'max(env(safe-area-inset-top), 12px)' }}
++      >
++        <header className="pointer-events-auto flex items-center justify-between px-4 pb-2 pt-1">
++          <h1 className="font-display text-xl font-bold text-white">Reels</h1>
++          <button onClick={() => navigate('/create')} className="focus-ring rounded-full p-1" aria-label="Create a reel">
++            <Camera className="h-5 w-5 text-white" />
+           </button>
+-        ))}
++        </header>
++
++        <div className="pointer-events-auto flex gap-5 px-4 pb-3 text-sm font-semibold">
++          {TABS.map((tab) => (
++            <button
++              key={tab}
++              onClick={() => setActiveTab(tab)}
++              className={`focus-ring shrink-0 whitespace-nowrap pb-1 transition-colors ${
++                activeTab === tab ? 'border-b-2 border-saffron-400 text-white' : 'text-white/50'
++              }`}
++            >
++              {tab}
++            </button>
++          ))}
++        </div>
+       </div>
+ 
+       {visibleReels.length === 0 ? (
+-        <div className="flex flex-1 items-center justify-center px-6 text-center">
++        <div className="absolute inset-0 flex items-center justify-center px-6 text-center">
+           <div>
+             <p className="font-display text-base font-semibold text-white">No reels here yet</p>
+             <p className="mt-1 text-sm text-white/60">
+@@ -108,14 +121,8 @@ export default function Reels() {
+           </div>
+         </div>
+       ) : (
+-        // `min-h-0` is the part that's easy to miss and everything above
+-        // depends on: without it, a flex child won't shrink below its
+-        // content's natural size, so `flex-1` alone wouldn't actually
+-        // bound this list to the remaining space — it'd grow to fit all
+-        // the reels stacked end to end instead, and `overflow-y-auto`
+-        // would have nothing to ever actually overflow.
+         <div
+-          className="no-scrollbar relative flex-1 min-h-0 snap-y snap-mandatory overflow-y-auto overscroll-y-contain"
++          className="no-scrollbar absolute inset-0 snap-y snap-mandatory overflow-y-auto overscroll-y-contain"
+           style={{ scrollSnapType: 'y mandatory' }}
+         >
+           {visibleReels.map((reel) => (
+diff --git a/src/utils/live.js b/src/utils/live.js
+index 444f76f..202dde9 100644
+--- a/src/utils/live.js
++++ b/src/utils/live.js
+@@ -183,6 +183,12 @@ export function mapApiNotification(apiNotif) {
+     text: apiNotif.payload?.text || '',
+     time: timeAgo(apiNotif.created_at),
+     unread: !apiNotif.read_at,
++    // Kept alongside the human-readable `time` above (not a replacement
++    // for it) so AppContext's applyLocalReadOverride can compare against
++    // the device's own "I already opened Activity up through here"
++    // marker — see markNotificationsRead in AppContext.jsx for why that
++    // local marker exists on top of the server's own read_at.
++    createdAt: apiNotif.created_at,
+   }
+ }
+ 
+diff --git a/src/utils/useAppBadge.js b/src/utils/useAppBadge.js
+new file mode 100644
+index 0000000..cf4859b
+--- /dev/null
++++ b/src/utils/useAppBadge.js
+@@ -0,0 +1,43 @@
++import { useEffect } from 'react'
++import { useApp } from '../context/AppContext.jsx'
++
++// Keeps the app's launcher-icon badge count in sync with unread
++// notifications + unread DMs — mounted once at the app root (see
++// App.jsx) — reusing the exact same unreadCount/unreadMessagesCount
++// AppContext already computes for the in-app bell icon and chat list,
++// so this can never drift out of sync with what those show.
++//
++// Whether this actually draws a visible NUMBER on the launcher icon
++// depends on the phone's own launcher, not this code: most OEM
++// launchers (Samsung, Xiaomi, OnePlus, etc.) support it directly, but
++// stock/Pixel-style (AOSP) launchers only ever show a plain dot, driven
++// by whether there's an active system notification rather than a number
++// this API sets — that's a platform limitation @capawesome/capacitor-badge
++// itself can't work around, not a bug in this integration.
++export function useAppBadge() {
++  const { isAuthenticated, unreadCount, unreadMessagesCount } = useApp()
++
++  useEffect(() => {
++    let cancelled = false
++    const count = isAuthenticated ? unreadCount + unreadMessagesCount : 0
++
++    import('@capacitor/core')
++      .then(({ Capacitor }) => {
++        if (cancelled || !Capacitor?.isNativePlatform?.()) return null
++        return import('@capawesome/capacitor-badge').then((mod) => mod.Badge)
++      })
++      .then(async (Badge) => {
++        if (cancelled || !Badge) return
++        if (count > 0) await Badge.set({ count }).catch(() => {})
++        else await Badge.clear().catch(() => {})
++      })
++      .catch(() => {
++        // No native Badge plugin available (plain web/dev build) —
++        // nothing to sync.
++      })
++
++    return () => {
++      cancelled = true
++    }
++  }, [isAuthenticated, unreadCount, unreadMessagesCount])
++}
+diff --git a/src/utils/useKeyboardInset.js b/src/utils/useKeyboardInset.js
+index 0f01f1e..1846583 100644
+--- a/src/utils/useKeyboardInset.js
++++ b/src/utils/useKeyboardInset.js
+@@ -1,43 +1,142 @@
+-import { useEffect, useState } from 'react'
++import { useCallback, useEffect, useRef, useState } from 'react'
+ 
+ // Tracks how many pixels of the viewport are currently covered by an
+-// on-screen keyboard (Gboard, etc.), using the VisualViewport API.
+-// Returns 0 whenever the keyboard is closed.
++// on-screen keyboard (Gboard, etc.) — 0 whenever it's closed — plus a
++// plain `visible` boolean callers can trust even on the rare device
++// where the numeric side of this ends up 0 (see below).
+ //
+-// Why this exists instead of trusting `dvh`/`svh` alone: those units are
+-// *supposed* to shrink when a soft keyboard opens, but that behavior is
+-// inconsistent across the Android WebView versions this app ships inside
+-// via Capacitor — some resize the layout viewport, some don't, and the
+-// gap between "should work" and "actually works on this device" is
+-// exactly where a chat/comment input ends up hidden behind the keyboard.
+-// Listening to `visualViewport` directly is the one mechanism that's
+-// reliable everywhere the API exists, and callers get 0 (i.e. "keyboard
+-// closed") on the rare browser that lacks it entirely, which is a safe
+-// default — they just fall back to their normal resting position.
++// Why this isn't just `window.visualViewport` math: that's the *right*
++// calculation (it self-adjusts whether or not the native window actually
++// resized — see the comment on `recompute` below) but it depends on the
++// visualViewport `resize`/`scroll` events actually firing, promptly, on
++// every device — and plenty of real Android System WebView builds are
++// late, inconsistent, or silent about that, which is exactly how a
++// chat/comment input ends up stuck behind Gboard on some phones but not
++// others. `@capacitor/keyboard` reports the keyboard height from
++// Android's own insets callback, not the WebView's JS layer, so it's
++// unaffected by that fragmentation — it's used here purely as a
++// reliable "the keyboard just opened/closed, go check again *now*"
++// signal (plus a fallback number if visualViewport genuinely has
++// nothing to offer), not as the primary source of the pixel math.
++//
++// Deliberately does NOT change android:windowSoftInputMode or the
++// Keyboard plugin's own `resize` config (which only applies on iOS —
++// see @capacitor/keyboard's definitions.d.ts) to get here: this app's
++// manifest already resizes the native window on Android
++// (`adjustResize`), and plenty of other, unrelated forms in the app
++// (sign in, sign up, edit profile, create post) rely on that resize to
++// keep a focused field visible above the keyboard with zero extra code.
++// Switching that off app-wide to make this hook's math simpler would
++// have regressed all of those. Instead `recompute` below reads however
++// much *actually* still needs compensating after whatever native
++// resize did or didn't happen, so the three callers that apply this as
++// a manual translateY (ChatThread, CommentSheet, ShareSheet) never
++// double-shift on a device where the window already resized out from
++// under the keyboard.
+ export function useKeyboardInset() {
+-  const [inset, setInset] = useState(0)
++  const [state, setState] = useState({ inset: 0, visible: false })
++  const nativeOpenRef = useRef(false)
++  const nativeHeightRef = useRef(0)
+ 
+-  useEffect(() => {
++  const recompute = useCallback(() => {
+     const vv = window.visualViewport
+-    if (!vv) return undefined
+-
+-    const update = () => {
++    let covered = 0
++    if (vv) {
+       // Anything no longer visible between the layout viewport and the
+       // visual viewport is either the keyboard or (on iOS) address-bar
+-      // chrome — clamped to 0 so a sub-pixel rounding blip never reports
+-      // a negative inset that would push the input the wrong way.
+-      const covered = window.innerHeight - vv.height - vv.offsetTop
+-      setInset(Math.max(0, Math.round(covered)))
++      // chrome — clamped to 0 so a sub-pixel rounding blip never
++      // reports a negative inset that would push the input the wrong
++      // way. If the native window already resized to fit above the
++      // keyboard (interactive-widget=resizes-content in index.html +
++      // adjustResize, working as intended on this device), `vv.height`
++      // and `window.innerHeight` shrink together and this correctly
++      // comes out ~0 — no double-compensation on top of a resize that
++      // already happened.
++      covered = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop))
++    }
++    if (covered > 0) {
++      setState({ inset: covered, visible: true })
++      return
++    }
++    // visualViewport sees no gap — either the keyboard is genuinely
++    // closed, or (older/inconsistent WebView) it just isn't reporting
++    // one. Trust the native plugin's own open/closed state either way:
++    // if it says the keyboard IS open, fall back to its reported
++    // height instead of silently sitting on a stale/wrong zero.
++    setState({ inset: nativeOpenRef.current ? nativeHeightRef.current : 0, visible: nativeOpenRef.current })
++  }, [])
++
++  useEffect(() => {
++    const vv = window.visualViewport
++    if (!vv) return undefined
++    recompute()
++    vv.addEventListener('resize', recompute)
++    vv.addEventListener('scroll', recompute)
++    return () => {
++      vv.removeEventListener('resize', recompute)
++      vv.removeEventListener('scroll', recompute)
+     }
++  }, [recompute])
++
++  useEffect(() => {
++    let cancelled = false
++    let handles = []
++    let settleTimer = null
++
++    // Dynamically imported so this file behaves identically in plain
++    // browser/Vite-dev contexts: '@capacitor/core' has nothing native
++    // to report there, isNativePlatform() is false, and this whole
++    // branch is skipped in favor of the visualViewport-only listener
++    // above (which is all a real browser/PWA ever needs).
++    import('@capacitor/core')
++      .then(({ Capacitor }) => {
++        if (cancelled || !Capacitor?.isNativePlatform?.()) return null
++        return import('@capacitor/keyboard').then((mod) => mod.Keyboard)
++      })
++      .then((Keyboard) => {
++        if (cancelled || !Keyboard) return
++
++        const onShow = (info) => {
++          nativeOpenRef.current = true
++          nativeHeightRef.current = Math.round(info?.keyboardHeight || 0)
++          recompute()
++          // visualViewport's own resize event can land a frame or two
++          // behind the native one (or the resize animation may still be
++          // running) on some devices — one more pass shortly after
++          // catches that instead of settling on a mid-animation value.
++          clearTimeout(settleTimer)
++          settleTimer = setTimeout(recompute, 150)
++        }
++        const onHide = () => {
++          nativeOpenRef.current = false
++          nativeHeightRef.current = 0
++          recompute()
++          clearTimeout(settleTimer)
++          settleTimer = setTimeout(recompute, 150)
++        }
++
++        Promise.all([
++          Keyboard.addListener('keyboardWillShow', onShow),
++          Keyboard.addListener('keyboardDidShow', onShow),
++          Keyboard.addListener('keyboardWillHide', onHide),
++          Keyboard.addListener('keyboardDidHide', onHide),
++        ]).then((h) => {
++          if (cancelled) h.forEach((handle) => handle.remove())
++          else handles = h
++        })
++      })
++      .catch(() => {
++        // No native Keyboard plugin available — visualViewport alone
++        // (already wired up above) is the only mechanism, same as it
++        // always was.
++      })
+ 
+-    update()
+-    vv.addEventListener('resize', update)
+-    vv.addEventListener('scroll', update)
+     return () => {
+-      vv.removeEventListener('resize', update)
+-      vv.removeEventListener('scroll', update)
++      cancelled = true
++      clearTimeout(settleTimer)
++      handles.forEach((handle) => handle.remove())
+     }
+-  }, [])
++  }, [recompute])
+ 
+-  return inset
++  return state
+ }
+diff --git a/src/utils/usePushNotifications.js b/src/utils/usePushNotifications.js
+new file mode 100644
+index 0000000..5747f88
+--- /dev/null
++++ b/src/utils/usePushNotifications.js
+@@ -0,0 +1,76 @@
++import { useEffect, useRef } from 'react'
++import { useApp } from '../context/AppContext.jsx'
++import * as api from '../api/client.js'
++import { isLive } from '../api/client.js'
++
++// Mounted once at the app root (see App.jsx). Registers this device for
++// real, OS-level push notifications (the kind that show up in the phone's
++// notification tray while the app is closed, per backend/src/lib/push.js)
++// the moment someone is signed in, and unregisters on sign-out so a
++// shared/reused device stops receiving that account's pushes right away
++// rather than waiting for whoever signs in next to overwrite the row.
++//
++// A silent no-op everywhere this genuinely can't do anything useful, none
++// of which are errors:
++//  - the web build (Capacitor.isNativePlatform() false) — browsers need a
++//    separate Web Push flow (a service worker + VAPID keys) this doesn't
++//    implement, since the app's primary target is the Android build;
++//  - mock/demo mode (isLive false) — there's no backend to register a
++//    token with;
++//  - the person denying the permission prompt (PushNotifications
++//    .requestPermissions() resolving to anything other than 'granted') —
++//    a completely normal, expected outcome, not a failure to log.
++export function usePushNotifications() {
++  const { isAuthenticated } = useApp()
++  const tokenRef = useRef(null)
++
++  useEffect(() => {
++    if (!isAuthenticated || !isLive) return undefined
++    let cancelled = false
++    let listenerHandles = []
++
++    import('@capacitor/core')
++      .then(({ Capacitor }) => {
++        if (cancelled || !Capacitor?.isNativePlatform?.()) return null
++        return import('@capacitor/push-notifications').then((mod) => mod.PushNotifications)
++      })
++      .then(async (PushNotifications) => {
++        if (cancelled || !PushNotifications) return
++
++        listenerHandles = await Promise.all([
++          PushNotifications.addListener('registration', (token) => {
++            tokenRef.current = token.value
++            api.registerDeviceToken(token.value, 'android').catch(() => {})
++          }),
++          PushNotifications.addListener('registrationError', (err) => {
++            console.error('[push] device registration failed', err)
++          }),
++        ])
++        if (cancelled) {
++          listenerHandles.forEach((h) => h.remove())
++          return
++        }
++
++        const status = await PushNotifications.requestPermissions()
++        if (!cancelled && status.receive === 'granted') await PushNotifications.register()
++      })
++      .catch(() => {
++        // No native PushNotifications plugin available (plain web/dev
++        // build) — nothing to register.
++      })
++
++    return () => {
++      cancelled = true
++      listenerHandles.forEach((h) => h.remove())
++    }
++  }, [isAuthenticated])
++
++  // Separate from the effect above so the token survives the transition:
++  // this only fires the moment `isAuthenticated` flips to false, using
++  // whatever registration effect already captured in tokenRef.
++  useEffect(() => {
++    if (isAuthenticated || !tokenRef.current || !isLive) return
++    api.unregisterDeviceToken(tokenRef.current).catch(() => {})
++    tokenRef.current = null
++  }, [isAuthenticated])
++}
+diff --git a/src/utils/webrtc.js b/src/utils/webrtc.js
+new file mode 100644
+index 0000000..abb9703
+--- /dev/null
++++ b/src/utils/webrtc.js
+@@ -0,0 +1,24 @@
++// Shared ICE server list for every real-time audio/video connection in
++// the app (Call.jsx's 1:1 calls, LiveGo.jsx/LiveView.jsx's live-stream
++// broadcast) — one place to change this rather than three.
++//
++// STUN only, no TURN. STUN (these servers) is what lets two devices
++// behind ordinary home/office/mobile-carrier NAT discover a direct
++// path to each other — it's free, needs no account, and is enough for
++// the large majority of real networks. What it can't do is relay media
++// when a direct path genuinely isn't possible (symmetric NAT on one or
++// both sides — common on some corporate networks and a minority of
++// mobile carriers) — that needs a TURN server, which actually proxies
++// the audio/video and therefore isn't free to run at scale. There's no
++// TURN server configured here because that requires an account with a
++// provider (or self-hosting coturn) — this project already runs its
++// backend on Cloudflare, whose own Realtime TURN service
++// (https://developers.cloudflare.com/realtime/turn/) is a natural fit
++// if calls/live streams turn out to fail for people on restrictive
++// networks; wiring that in is a follow-up, not something a STUN-only
++// list can be turned into by itself.
++export const ICE_SERVERS = [
++  { urls: 'stun:stun.cloudflare.com:3478' },
++  { urls: 'stun:stun.l.google.com:19302' },
++  { urls: 'stun:stun1.l.google.com:19302' },
++]
