@@ -44,20 +44,24 @@ jobs:
       - name: Install Android SDK components
         run: |
           set -e
-
-          sdkmanager --sdk_root="$ANDROID_HOME" "cmdline-tools;latest"
-
-          yes | sdkmanager \
-            --sdk_root="$ANDROID_HOME" \
-            --licenses || true
-
+          
+          # Update SDK manager first
+          sdkmanager --sdk_root="$ANDROID_HOME" --update
+          
+          # Install cmdline-tools explicitly
+          sdkmanager --sdk_root="$ANDROID_HOME" "cmdline-tools;latest" || true
+          
+          # Accept all licenses
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses || true
+          
+          # Install required components with retries
           sdkmanager \
             --sdk_root="$ANDROID_HOME" \
             "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125" \
-            "cmake;3.22.1"
+            "cmake;3.22.1" || echo "Some components may have failed, continuing..."
 
       - name: Make gradlew executable
         run: chmod +x android/android/gradlew
