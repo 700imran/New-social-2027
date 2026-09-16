@@ -1,0 +1,93 @@
+From 8857d54475300d18d3eb658c8dd2c2ddee3727b7 Mon Sep 17 00:00:00 2001
+From: Repo Audit <audit@example.com>
+Date: Wed, 16 Sep 2026 09:45:05 +0000
+Subject: [PATCH] Fix APK build JDK mismatch and add missing camera/mic
+ permissions
+
+- build-apk.yml: use JDK 17 instead of 21. Gradle 8.2.1 (pinned in
+  gradle-wrapper.properties) only supports running under JDK 8-20;
+  JDK 21 execution support requires Gradle 8.5+. AGP 8.2's default
+  JDK is 17, and capacitor.build.gradle already targets
+  JavaVersion.VERSION_17, so 17 is what the project actually expects.
+  Running under 21 causes gradlew to fail on startup (typically
+  'Unsupported class file major version 65').
+
+- build-apk.yml: drop the ndk/cmake sdkmanager install. The project
+  has no native C/C++ code, so these were an unused, slow, and
+  unnecessary extra point of failure in a step that has already
+  broken this workflow multiple times.
+
+- AndroidManifest.xml: declare CAMERA, RECORD_AUDIO, and
+  MODIFY_AUDIO_SETTINGS permissions (plus an optional camera
+  uses-feature). Call.jsx and LiveGo.jsx call getUserMedia() for
+  local camera/mic preview. Capacitor's bundled
+  BridgeWebChromeClient.onPermissionRequest already requests these
+  from the OS on the WebView's behalf, but Android silently denies
+  any runtime permission request for a permission that isn't
+  declared in the manifest first, so the preview was failing on
+  device despite working in a browser.
+---
+ .github/workflows/build-apk.yml                  | 12 ++++++------
+ android/android/app/src/main/AndroidManifest.xml | 12 ++++++++++++
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/.github/workflows/build-apk.yml b/.github/workflows/build-apk.yml
+index 5ba4cac..73ff5d8 100644
+--- a/.github/workflows/build-apk.yml
++++ b/.github/workflows/build-apk.yml
+@@ -32,11 +32,11 @@ jobs:
+         working-directory: android
+         run: npm run sync
+ 
+-      - name: Set up JDK 21
++      - name: Set up JDK 17
+         uses: actions/setup-java@v4
+         with:
+           distribution: temurin
+-          java-version: "21"
++          java-version: "17"
+ 
+       - name: Set up Android SDK
+         run: |
+@@ -56,13 +56,13 @@ jobs:
+           # Accept licenses
+           yes | ./sdkmanager --sdk_root="$ANDROID_HOME" --licenses > /dev/null 2>&1 || true
+           
+-          # Install required SDK components
++          # Install required SDK components. NDK/CMake are deliberately not
++          # installed here — this project has no native C/C++ code, so they
++          # would just be an unused, slow, extra-failure-surface download.
+           ./sdkmanager --sdk_root="$ANDROID_HOME" \
+             "platform-tools" \
+             "platforms;android-34" \
+-            "build-tools;34.0.0" \
+-            "ndk;26.1.10909125" \
+-            "cmake;3.22.1" || echo "Warning: Some components may have failed"
++            "build-tools;34.0.0" || echo "Warning: Some components may have failed"
+ 
+       - name: Make gradlew executable
+         run: chmod +x android/android/gradlew
+diff --git a/android/android/app/src/main/AndroidManifest.xml b/android/android/app/src/main/AndroidManifest.xml
+index 3e988f2..5e294cd 100644
+--- a/android/android/app/src/main/AndroidManifest.xml
++++ b/android/android/app/src/main/AndroidManifest.xml
+@@ -34,4 +34,16 @@
+     <!-- Permissions -->
+ 
+     <uses-permission android:name="android.permission.INTERNET" />
++
++    <!-- Call.jsx and LiveGo.jsx use getUserMedia() for local camera/mic
++         preview. Capacitor's bundled BridgeWebChromeClient already requests
++         these from the OS on the WebView's behalf (see
++         node_modules/@capacitor/android/.../BridgeWebChromeClient.java) —
++         but Android silently denies any runtime permission request that
++         isn't declared here first, so without these lines that request
++         never has anything to grant. -->
++    <uses-permission android:name="android.permission.CAMERA" />
++    <uses-permission android:name="android.permission.RECORD_AUDIO" />
++    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
++    <uses-feature android:name="android.hardware.camera" android:required="false" />
+ </manifest>
+-- 
+2.43.0
+
